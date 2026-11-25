@@ -7,6 +7,9 @@ needs the explicit --publish flag AND the robot's ROS 2 environment (domain 232,
     python3 robot/teleop_bridge.py --port 39500 --record /tmp/out.rec          # dry run
     python3 robot/teleop_bridge.py --port 39500 --sender-ip 192.168.1.50 --publish
 
+Unless --no-discovery is given it also answers NTD1 discovery probes on --discovery-port
+(default 39501) so the headset app can find it; see docs/DISCOVERY.md.
+
 Safety behaviour (details in README.md):
   * one sender only (--sender-ip, or the first address that sends a fully valid datagram)
   * wrong magic/version/length/CRC, duplicate and out-of-order datagrams are dropped
@@ -26,7 +29,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from robot import a3_proto  # noqa: E402
+from robot import a3_proto, discovery  # noqa: E402
 from robot.bridge_core import BridgeCore, Limits  # noqa: E402
 from robot.recording import KIND_VR_BUTTON, KIND_XR_FRAME, RecordWriter  # noqa: E402
 from teleop_common.transform import load_config  # noqa: E402
@@ -130,6 +133,10 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--max-abs-position", type=float, default=d.max_abs_position_m)
     ap.add_argument("--max-speed", type=float, default=d.max_speed_mps, help="per-joint speed limit, m/s")
     ap.add_argument("--min-jump", type=float, default=d.min_jump_m, help="jump (m) that is always tolerated")
+    ap.add_argument("--no-discovery", dest="discovery", action="store_false",
+                    help="do not answer NTD1 discovery probes (docs/DISCOVERY.md)")
+    ap.add_argument("--discovery-port", type=int, default=discovery.DEFAULT_DISCOVERY_PORT,
+                    help="UDP port of the discovery responder (default %(default)s)")
     ap.add_argument("--allow-no-body", action="store_true", help="accept frames without body tracking")
     ap.add_argument("--allow-synthetic", action="store_true",
                     help="with --publish: also publish frames produced by the fake SDK (never do this on a live robot)")
@@ -143,6 +150,11 @@ def main(argv=None) -> int:
     a = ap.parse_args(argv)
     if a.port in FORBIDDEN_PORTS:
         ap.error("port %d belongs to the robot's own teleop stack" % a.port)
+    if a.discovery:
+        if a.discovery_port in FORBIDDEN_PORTS:
+            ap.error("discovery port %d belongs to the robot's own teleop stack" % a.discovery_port)
+        if not 1024 <= a.discovery_port <= 65535 or a.discovery_port == a.port:
+            ap.error("--discovery-port must be 1024..65535 and differ from --port")
     if a.resync_ms <= a.watchdog_ms:
         ap.error("--resync-ms must be larger than --watchdog-ms")
     limits = Limits(watchdog_ms=a.watchdog_ms, resume_frames=max(1, a.resume_frames), resync_ms=a.resync_ms,
@@ -167,10 +179,27 @@ def main(argv=None) -> int:
     recorder = RecordWriter(a.record) if a.record else None
     publisher = RosPublisher(a.allow_other_publishers) if a.publish else DryRunPublisher()
 
+    # Discovery responder (docs/DISCOVERY.md). Read-only: it reports mode and lock state and
+    # never touches the bridge core. A port that cannot be bound only disables discovery.
+    disco = None
+    if a.discovery:
+        model, robot_id = discovery.read_robot_identity()
+        responder = discovery.DiscoveryResponder(
+            a.port, lambda: (discovery.MODE_PUBLISH if a.publish else discovery.MODE_DRY_RUN,
+                             core.sender_ip is not None),
+            model=model, robot_id=robot_id)
+        try:
+            disco = discovery.DiscoveryServer(responder, a.listen_ip, a.discovery_port)
+        except OSError as e:
+            log("discovery: cannot bind UDP %s:%d (%s) -> discovery disabled, teleop unaffected"
+                % (a.listen_ip, a.discovery_port, e))
+    read_socks = [sock] + ([disco] if disco else [])
+
     log("mode=%s listen=%s:%d sender=%s config=%s (%s)" % (
         "PUBLISH" if a.publish else "DRY-RUN", a.listen_ip, a.port, a.sender_ip or "first-seen",
         a.config, cfg.get("status", "?")))
     log("topics: %s , %s" % (VR_DATA_TOPIC, VR_BUTTON_TOPIC))
+    log("discovery: %s" % ("answering NTD1 probes on UDP %d" % disco.port if disco else "off"))
     if a.publish:
         log("*** LIVE: publishing to the robot. Keep the e-stop within reach. ***")
 
@@ -185,12 +214,14 @@ def main(argv=None) -> int:
             if a.duration and now - t_start >= a.duration:
                 break
             try:
-                readable, _, _ = select.select([sock], [], [], 0.02)
+                readable, _, _ = select.select(read_socks, [], [], 0.02)
             except InterruptedError:
                 continue
             now = time.monotonic()
             newest = None
-            if readable:
+            if disco is not None and disco in readable:
+                disco.service(now)
+            if sock in readable:
                 # Drain the socket; validate everything, but only pass on the newest valid frame
                 # so a backlog (e.g. after a scheduling hiccup) is never replayed late.
                 while True:
@@ -230,6 +261,8 @@ def main(argv=None) -> int:
     finally:
         # Stop = silence. Nothing further is published from here on.
         sock.close()
+        if disco is not None:
+            disco.close()
         if recorder:
             recorder.close()
         total = publisher.count
@@ -239,6 +272,8 @@ def main(argv=None) -> int:
             signal.Signals(stop["sig"]).name if stop["sig"] else "done", s["rx"], s["valid"],
             "published" if a.publish else "would-publish", total,
             {k[7:]: v for k, v in s.items() if k.startswith("reject_")} or "none", s["watchdog_trips"]))
+        if disco is not None:
+            log("discovery: %s" % (dict(disco.responder.stats) or "no probes"))
     return 0
 
 

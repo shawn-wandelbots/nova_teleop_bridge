@@ -46,11 +46,12 @@ pc/fake_xrt.py               fake SDK (synthetic figure, or replay of recorded A
 robot/a3_proto.py            protobuf codec for XRFrameData / VRButtonChannel
 robot/bridge_core.py         validation, safety logic, conversion (no I/O)
 robot/teleop_bridge.py       robot main program (UDP in, dry-run / ROS out)
+robot/discovery.py           NTD1 discovery responder (lets the headset app find the bridge)
 robot/recording.py           record / capture file formats
 tools/capture_udp.py         capture raw datagrams on loopback (used with pico_mock_player)
 tools/analyze_frames.py      prints the numbers in docs/A3_FRAME_ANALYSIS.md
 tests/                       unit + loopback tests, two small excerpts of the robot's PICO sample
-docs/                        A3_FRAME_ANALYSIS.md, WIRE_FORMAT.md
+docs/                        A3_FRAME_ANALYSIS.md, WIRE_FORMAT.md, DISCOVERY.md
 ```
 
 Dependencies: Python standard library only (3.8+ on the PC, 3.11 on the robot). The PC
@@ -65,7 +66,8 @@ when `--publish` is given (they are imported lazily, tests never load them).
 python3 -m unittest            # from the repository root
 ```
 
-Uses loopback UDP on private ports ≥ 39200 only; publishes nothing; does not need ROS.
+Uses loopback UDP on private ports ≥ 39200 only (never the default ports 39500/39501, the
+discovery tests use ≥ 39600); publishes nothing; does not need ROS.
 
 ### Robot side – dry run (the default)
 
@@ -89,6 +91,32 @@ for j in f.body: print(BODY_JOINT_NAMES[j.code], j.pos, j.quat)
 print(decode_vr_buttons(next(r[2] for r in recs if r[0] == 2)))
 PY
 ```
+
+### Discovery (finding the robot from the headset)
+
+The robot's Wi-Fi address changes with DHCP, so the headset app (Nova Teleop setup screen,
+"Find robots") searches for it instead of relying on a typed-in address:
+
+* The bridge answers **NTD1 discovery probes** on UDP **39501** (`--discovery-port N`;
+  `--no-discovery` to switch it off) in both dry-run and publishing mode. The reply carries the
+  robot model, the last 4 characters of the robot's name, the NTB1 data port, the mode
+  (`dry-run` / `publish`) and whether a sender is locked in. Protocol and rules:
+  [docs/DISCOVERY.md](docs/DISCOVERY.md).
+* Independently of the bridge, the app sends an LLMNR query for the head computer's default
+  hostname `hdu`, which the robot's operating system answers. That finds the robot even when the
+  bridge is not running.
+
+The responder is read-only: it answers only well-formed probes, one small reply (< 512 bytes)
+per probe, rate-limited per source, and a probe can never claim the sender lock or change any
+other bridge state. If port 39501 is taken the bridge logs it and runs without discovery.
+
+Limits: broadcast and multicast do not cross routers and are blocked by Wi-Fi client isolation
+(guest networks); LLMNR may be disabled; every AgiBot head computer answers to `hdu`, so several
+robots give several entries (tell them apart by `model` / `robot_id`); replies are not
+authenticated. A manually entered address always works.
+
+The app sends from the **headset's** address: `--sender-ip` must be that address (shown on the
+app's setup screen), or be left out to lock onto the first valid sender.
 
 ### Robot side – live publishing
 
@@ -138,7 +166,8 @@ Robot bridge:
   `session_gate`, 150/200 ms slowdown and 1000 ms hard timeout in teleop_avatar; see
   [docs/A3_FRAME_ANALYSIS.md](docs/A3_FRAME_ANALYSIS.md) §5).
 * Never binds or sends to the robot's own teleop ports (25618, 25619, 15000, 51000), never calls
-  a robot service.
+  a robot service. The discovery responder also refuses to reply to those ports and to ports
+  below 1024, and nothing it receives reaches the bridge core.
 
 PC sender: sends only what the SDK returned; skips a tick on any SDK error or NaN; goes silent
 when the SDK timestamp stops advancing for `--stale-ms` (100 ms); sends nothing on exit.

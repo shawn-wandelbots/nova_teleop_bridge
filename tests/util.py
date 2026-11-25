@@ -16,6 +16,8 @@ FORBIDDEN_PORTS = (25618, 25619, 15000, 51000)
 def free_udp_port(start=39200, end=39999):
     """A free loopback UDP port in the private test range (>= 39000)."""
     for port in range(start, end):
+        if port in (39500, 39501):      # default data / discovery ports: a real bridge may own them
+            continue
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             s.bind(("127.0.0.1", port))

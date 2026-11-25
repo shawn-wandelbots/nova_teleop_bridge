@@ -30,6 +30,7 @@ def run_pipeline(tmp, count, sender_extra=(), bridge_extra=(), config=CONFIG, ki
     bridge = subprocess.Popen(
         [sys.executable, BRIDGE, "--dry-run", "--listen-ip", "127.0.0.1", "--port", str(port),
          "--sender-ip", "127.0.0.1", "--record", rec, "--config", config, "--stats-interval", "0.5",
+         "--no-discovery",
          *bridge_extra],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
     try:

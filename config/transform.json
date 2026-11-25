@@ -1,0 +1,74 @@
+{
+  "_readme": [
+    "Single configuration file for everything that depends on XRoboToolkit conventions.",
+    "STATUS: PROVISIONAL. The 'sdk' and 'transform' sections are derived from the XRoboToolkit",
+    "documentation only and have NOT been verified against a real headset. The target frame",
+    "(robot side) is measured, see docs/A3_FRAME_ANALYSIS.md.",
+    "Keys starting with '_' are comments and are ignored."
+  ],
+  "status": "PROVISIONAL",
+
+  "sdk": {
+    "_note": "Function names of the xrobotoolkit_sdk Python module (used by pc/xrt_adapter.py only).",
+    "module": "xrobotoolkit_sdk",
+    "init": "init",
+    "close": "close",
+    "timestamp_ns": "get_time_stamp_ns",
+    "headset_pose": "get_headset_pose",
+    "left_pose": "get_left_controller_pose",
+    "right_pose": "get_right_controller_pose",
+    "left_trigger": "get_left_trigger",
+    "right_trigger": "get_right_trigger",
+    "left_grip": "get_left_grip",
+    "right_grip": "get_right_grip",
+    "left_axis": "get_left_axis",
+    "right_axis": "get_right_axis",
+    "left_axis_click": "get_left_axis_click",
+    "right_axis_click": "get_right_axis_click",
+    "button_a": "get_A_button",
+    "button_b": "get_B_button",
+    "button_x": "get_X_button",
+    "button_y": "get_Y_button",
+    "body_available": "is_body_data_available",
+    "body_joints": "get_body_joints_pose",
+    "_pose_order_note": "Index of x,y,z,qx,qy,qz,qw inside each 7-float SDK pose.",
+    "pose_order": [0, 1, 2, 3, 4, 5, 6]
+  },
+
+  "transform": {
+    "_note": [
+      "p_robot = scale * Rz(yaw_offset_deg) * axis_matrix * p_xrt + translation",
+      "R_robot = Rz(yaw_offset_deg) * (axis_matrix * R_xrt * axis_matrix^T) * R(local_rotation_xyzw)",
+      "PROVISIONAL default assumes the XRoboToolkit frame is OpenXR-like, right-handed:",
+      "+x right, +y up, -z forward, and that a joint's identity orientation means 'facing -z'.",
+      "Target (measured): right-handed, +z up, metres, joint-local +x forward / +y left / +z up.",
+      "So: robot.x = -xrt.z, robot.y = -xrt.x, robot.z = xrt.y.",
+      "If XRoboToolkit turns out to be left-handed (Unity: +z forward) use",
+      "[[0,0,1],[-1,0,0],[0,1,0]] instead (determinant -1 is supported)."
+    ],
+    "axis_matrix": [[0, 0, -1], [-1, 0, 0], [0, 1, 0]],
+    "scale": 1.0,
+    "yaw_offset_deg": 0.0,
+    "translation": [0.0, 0.0, 0.0],
+    "local_rotation_xyzw": [0.0, 0.0, 0.0, 1.0]
+  },
+
+  "controllers": {
+    "_note": "controller_code_name: 0 = left, 1 = right (stated in the robot's hal_remote trigger configs; not yet observed on the wire).",
+    "left_code": 0,
+    "right_code": 1,
+    "axis_x_sign": 1.0,
+    "axis_y_sign": 1.0,
+    "include_in_xr_frame": true
+  },
+
+  "output": {
+    "_timestamp_note": "unix_ms | unix_us | unix_ns | sender_ns | sdk_ns | const_u32max (the value seen in the PICO sample). UNVERIFIED which one the robot expects.",
+    "timestamp_mode": "unix_ms",
+    "_external_device_note": "UNKNOWN | YUANJI_APP | GENIELINK. GENIELINK makes the robot require BOTH grips for take-over in upper-body absolute mode (strictest).",
+    "external_device": "GENIELINK",
+    "explicit_defaults": true,
+    "_pose_joints_note": "EXPERIMENTAL/UNVERIFIED: also emit the controller poses as one Joint each in left_hand/right_hand. Off by default; the PICO sample has empty hand lists.",
+    "controller_pose_as_hand_joint": false
+  }
+}

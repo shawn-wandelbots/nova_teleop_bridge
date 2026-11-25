@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.rec
+*.cap
+*.mcap
+*.log
+.venv/
+venv/
+.env
+.idea/
+.vscode/
+*.swp
+.DS_Store

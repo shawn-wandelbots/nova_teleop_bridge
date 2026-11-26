@@ -93,7 +93,12 @@ python3 -m unittest discover -s tests
 python3 robot/teleop_service.py
 ```
 
-Then open `http://<robot address>:8090/` in a browser and follow the three steps on the page.
+It waits for the headset. When Nova Teleop on the headset connects, the headset shows a
+four-letter word and the page opens at `http://<robot address>:8090/`. Type the word to unlock
+it. To start it with the robot, see `deploy/nova-teleop.service`.
+
+No headset at hand? `python3 tools/session_hello.py --word TEST` on the robot opens the page
+the same way.
 
 **3. Or run the bridge by hand:**
 
@@ -128,12 +133,35 @@ flowchart TD
 - **Silence means stop.** When the stream stops, the bridge sends nothing. It never repeats
   old data and never invents a "release" message. The robot notices the silence and pauses.
 - **Buttons are never made up.** Triggers and grips are only limited to their valid range.
-- **The control page has no login.** Use it only on a network you trust.
+- **The control page is closed most of the time** and needs the word from the headset. This
+  keeps casual visitors out. It is not strong security and nothing is encrypted, so use it only
+  on a network you trust.
 - Keep the **emergency stop** in reach, and keep people out of reach of the arms.
 
 ## The control page
 
-`robot/teleop_service.py` serves one page (`web/index.html`):
+`robot/teleop_service.py` serves one page (`web/index.html`), but only while a headset is
+connected:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Closed
+    Closed --> Locked: headset connects<br/>(shows a 4-letter word)
+    Locked --> Open: word typed in the browser
+    Open --> Closed: headset disconnects
+    Open --> Closed: 15 minutes without use
+    Locked --> Closed: headset disconnects
+    Open --> Locked: headset reconnects<br/>(new word)
+```
+
+- The word is picked by the headset, new for every connection.
+- Five wrong words in a row pause the lock for 30 seconds.
+- Closing the page does **not** change what the robot is doing. Reconnect in the headset to
+  get the page back.
+- While the service runs, the bridge stays in **test mode** so the headset can find the robot.
+  *Go live* on the page switches it to live; *Back to test mode* switches it back.
+
+What is on the page:
 
 - **Robot** – current state and whether the robot's three computers answer.
 - **Start teleoperation** – the three steps above, with live numbers for the headset stream.
@@ -160,6 +188,8 @@ raw recording and convert on the server.
 |---|---|
 | `robot/teleop_service.py` | Control page server |
 | `web/index.html` | The control page |
+| `robot/session.py` | The headset's small "hello / goodbye" message that opens and closes the page |
+| `deploy/nova-teleop.service` | Start the service together with the robot (optional) |
 | `robot/teleop_bridge.py` | Bridge program: headset stream in, robot packets out |
 | `robot/bridge_core.py` | All checks and conversions, no network code (easy to test) |
 | `robot/a3_proto.py` | Writes and reads the robot's message formats by hand |
@@ -211,9 +241,10 @@ recommended path.
 ## First test on a real robot
 
 1. Robot hung up or otherwise safe, nobody within reach of the arms, emergency stop in hand.
-2. Control page: all three computers green, then **Start teleoperation mode**.
-3. **Start in test mode** and check the stream is healthy at about 100 frames a second.
-4. Stop, then **Start live**. Calibrate. Hold both grips briefly and watch one small movement.
+2. Connect in the headset, unlock the page. All three computers green, then
+   **Start teleoperation mode**.
+3. Check the stream is healthy at about 100 frames a second (the link starts in test mode).
+4. **Go live**. Calibrate. Hold both grips briefly and watch one small movement.
 5. Release the grips. Then **Leave teleoperation mode**.
 
 For an even more careful first step, `tools/static_pose_test.py` sends a fixed pose and moves

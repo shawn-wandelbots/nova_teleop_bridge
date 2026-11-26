@@ -1,9 +1,17 @@
 #!/usr/bin/env python3
 """Nova Teleop control page, hosted on the robot.
 
-    python3 robot/teleop_service.py                 # then open http://<robot>:8090/
+    python3 robot/teleop_service.py
 
-What it does:
+The page is NOT reachable all the time.  It opens when the headset app connects (the app
+sends a small "hello" with a random four-letter word, see robot/session.py) and it closes
+when the app says goodbye or after 15 minutes without anyone using the page.  The browser
+has to type the word shown in the headset before it gets anything but the lock screen.
+
+While it runs, the service also keeps the teleop bridge in test mode, so the headset app can
+find the robot and its stream can be checked.  Test mode sends nothing to the robot.
+
+What the page does:
   * shows the robot's state, its three boards, the robot's teleop input and the headset link
   * switches the robot into and out of its teleoperation state (the same two calls the
     vendor phone app makes)
@@ -11,13 +19,17 @@ What it does:
   * keeps the settings, including the ones for data collection that is not built yet
 
 Nothing here moves the robot by itself: every action is a button press on the page.
-Stdlib only.  There is no login: run it only on a network you trust.
+Stdlib only.  The four-letter word keeps casual visitors out; it is not strong security,
+and traffic is not encrypted: run it only on a network you trust.
 """
 from __future__ import annotations
 
 import argparse
+import hmac
 import json
 import os
+import secrets
+import select
 import signal
 import socket
 import subprocess
@@ -29,9 +41,13 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
+from robot import session as sess  # noqa: E402
+
 WEB_DIR = os.path.join(ROOT, "web")
 BRIDGE = os.path.join(ROOT, "robot", "teleop_bridge.py")
 TELEOP_STATE = "RemoteMotionStream"
+COOKIE = "nova_teleop"
 
 BOARDS = (("head", "Head board", "10.42.10.10"), ("main", "Main controller", "10.42.10.12"),
           ("compute", "Compute board", "10.42.10.11"))
@@ -108,12 +124,64 @@ class Service:
         self.status_file = os.path.join(args.run_dir, "bridge_status.json")
         self.bridge_log = os.path.join(args.run_dir, "bridge.log")
         os.makedirs(args.run_dir, exist_ok=True)
+        self.closing = False
         self.bridge = None            # subprocess.Popen
         self.bridge_mode = None
         self.transition = None        # {"action", "since", "error"}
         self.last_error = ""
         self.cache = {"robot": {"reachable": False}, "boards": {}, "input": {}}
+        # ---- page access (see Gate) ----
+        self.word = None              # four letters from the headset; None = page closed
+        self.token = None             # cookie value of the unlocked browser(s)
+        self.last_interaction = 0.0
+        self.bad_tries = 0
+        self.locked_until = 0.0
         threading.Thread(target=self._poll_loop, daemon=True).start()
+
+    # ---- page access ------------------------------------------------------------------------
+    def open_page(self, word):
+        with self.lock:
+            self.word, self.token = word, secrets.token_urlsafe(24)
+            self.last_interaction = time.time()
+            self.bad_tries, self.locked_until = 0, 0.0
+
+    def close_page(self):
+        with self.lock:
+            self.word = self.token = None
+
+    def touch(self):
+        self.last_interaction = time.time()
+
+    def idle_seconds(self):
+        return time.time() - self.last_interaction
+
+    def unlock(self, word):
+        """Returns the cookie token, or raises PermissionError with a message for the page."""
+        now = time.time()
+        with self.lock:
+            if self.word is None:
+                raise PermissionError("the page is closed")
+            if now < self.locked_until:
+                raise PermissionError("too many wrong tries: wait %d s" % (self.locked_until - now + 1))
+            ok = hmac.compare_digest(str(word).strip().upper().encode(), self.word.encode())
+            if not ok:
+                self.bad_tries += 1
+                if self.bad_tries >= self.a.max_tries:
+                    self.bad_tries, self.locked_until = 0, now + self.a.lockout_s
+                raise PermissionError("that is not the word shown in the headset")
+            self.bad_tries = 0
+            self.last_interaction = now
+            return self.token
+
+    def authorised(self, cookie_header):
+        token = self.token
+        if not token or not cookie_header:
+            return False
+        for part in cookie_header.split(";"):
+            k, _, v = part.strip().partition("=")
+            if k == COOKIE and hmac.compare_digest(v.encode(), token.encode()):
+                return True
+        return False
 
     # ---- settings -----------------------------------------------------------------------
     def _load_settings(self):
@@ -209,9 +277,11 @@ class Service:
     def start_bridge(self, mode):
         if mode not in ("test", "live"):
             raise ValueError("mode must be 'test' or 'live'")
+        if self.bridge_running():
+            if self.bridge_mode == mode:
+                raise RuntimeError("the headset link is already in %s mode" % mode)
+            self._kill_bridge()
         with self.lock:
-            if self.bridge_running():
-                raise RuntimeError("the headset link is already running; stop it first")
             b = self.settings["bridge"]
             cmd = [sys.executable, BRIDGE, "--port", str(b["port"]), "--status-file", self.status_file]
             if b["sender_ip"]:
@@ -227,6 +297,19 @@ class Service:
         log("bridge started (%s), pid %d" % (mode, self.bridge.pid))
 
     def stop_bridge(self):
+        """Leave live mode. With standby on, the bridge goes back to test mode (sends nothing)."""
+        self._kill_bridge()
+        if self.a.standby and not self.closing:
+            try:
+                self.start_bridge("test")
+            except (RuntimeError, OSError) as e:
+                log("could not restart the bridge in test mode: %s" % e)
+
+    def shutdown(self):
+        self.closing = True
+        self._kill_bridge()
+
+    def _kill_bridge(self):
         with self.lock:
             p = self.bridge
         if p is None or p.poll() is not None:
@@ -273,6 +356,7 @@ class Service:
         snap["transition"] = tr
         snap["bridge"] = self._bridge_status()
         snap["settings"] = settings
+        snap["closes_in"] = max(0, int(self.a.idle_close_s - self.idle_seconds()))
         snap["time"] = time.time()
         return snap
 
@@ -284,10 +368,12 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):      # quiet: the poller would fill the log
         pass
 
-    def _send(self, code, body, ctype="application/json"):
+    def _send(self, code, body, ctype="application/json", cookie=None):
         if not isinstance(body, bytes):
             body = json.dumps(body).encode()
         self.send_response(code)
+        if cookie:
+            self.send_header("Set-Cookie", "%s=%s; Path=/; HttpOnly; SameSite=Strict" % (COOKIE, cookie))
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
@@ -298,6 +384,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split("?", 1)[0]
         if path == "/api/status":
+            if not self.svc.authorised(self.headers.get("Cookie")):
+                return self._send(401, {"error": "locked"})
             return self._send(200, self.svc.status())
         if path in ("/", "/index.html"):
             try:
@@ -321,8 +409,18 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError as e:
             return self._send(400, {"error": str(e)})
         path = self.path.split("?", 1)[0]
+        if path == "/api/unlock":
+            try:
+                return self._send(200, {"ok": True}, cookie=self.svc.unlock(body.get("word", "")))
+            except PermissionError as e:
+                return self._send(403, {"error": str(e)})
+        if not self.svc.authorised(self.headers.get("Cookie")):
+            return self._send(401, {"error": "locked"})
+        self.svc.touch()                    # any button press or page activity counts as use
         try:
-            if path == "/api/teleop/start":
+            if path == "/api/ping":
+                pass
+            elif path == "/api/teleop/start":
                 self.svc.teleop("start")
             elif path == "/api/teleop/stop":
                 self.svc.stop_bridge()          # stop feeding the robot before it leaves teleop
@@ -355,27 +453,128 @@ def build_parser():
     ap.add_argument("--robot-input-port", type=int, default=25618)
     ap.add_argument("--poll-s", type=float, default=2.0)
     ap.add_argument("--bridge-arg", action="append", default=[], help="extra argument for the bridge (repeatable)")
+    ap.add_argument("--session-port", type=int, default=sess.DEFAULT_PORT,
+                    help="UDP port for the headset's hello / goodbye (default %(default)s)")
+    ap.add_argument("--idle-close-s", type=float, default=900.0, help="close the page after this long without use")
+    ap.add_argument("--max-tries", type=int, default=5, help="wrong words before a pause")
+    ap.add_argument("--lockout-s", type=float, default=30.0)
+    ap.add_argument("--no-standby", dest="standby", action="store_false",
+                    help="do not keep the bridge running in test mode")
     return ap
+
+
+class Gate:
+    """Opens the web page when a headset says hello and closes it again.
+
+    hello (new session)  -> page opens with that word; browsers unlocked before are locked out
+    goodbye              -> page closes
+    idle_close_s unused  -> page closes
+    While a headset keeps saying hello, hellos from other addresses are ignored.
+    """
+    HELLO_FRESH_S = 5.0
+
+    def __init__(self, svc, args):
+        self.svc, self.a = svc, args
+        self.udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.udp.bind((args.listen_ip, args.session_port))
+        self.udp.setblocking(False)
+        self.session_port = self.udp.getsockname()[1]
+        self.httpd = None
+        self.web_port = None
+        self.peer = None              # (ip, session id)
+        self.ended = None             # the session whose page was closed: its late hellos do not reopen it
+        self.last_hello = 0.0
+        self._stop = False
+
+    def page_open(self):
+        return self.httpd is not None
+
+    def _open(self, word, why):
+        if self.httpd is None:
+            self.httpd = ThreadingHTTPServer((self.a.listen_ip, self.a.port), Handler)
+            self.httpd.daemon_threads = True
+            self.web_port = self.httpd.server_address[1]
+            threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        self.svc.open_page(word)
+        log("page OPEN on port %d (%s)" % (self.web_port, why))
+
+    def _close(self, why):
+        self.svc.close_page()
+        self.ended, self.peer = self.peer or self.ended, None
+        if self.httpd is not None:
+            h, self.httpd = self.httpd, None
+            h.shutdown()
+            h.server_close()
+            log("page CLOSED (%s)" % why)
+
+    def _on_datagram(self, data, ip, now):
+        try:
+            kind, sid, word = sess.unpack(data)
+        except ValueError:
+            return
+        only = self.svc.settings["bridge"]["sender_ip"]
+        if only and ip != only:
+            return
+        if kind == sess.HELLO:
+            if self.peer == (ip, sid):
+                self.last_hello = now
+                return
+            if self.ended == (ip, sid):
+                return                              # closed for this connection: reconnect in the headset
+            if self.peer and self.peer[0] != ip and now - self.last_hello < self.HELLO_FRESH_S:
+                return                              # another headset is connected right now
+            self.peer, self.last_hello = (ip, sid), now
+            self._open(word, "headset %s connected" % ip)
+        elif kind == sess.BYE and self.peer == (ip, sid):
+            self._close("headset closed the connection")
+        elif kind == sess.BYE and self.peer is None:
+            self.ended = (ip, sid)
+
+    def step(self, timeout=0.5):
+        try:
+            readable, _, _ = select.select([self.udp], [], [], timeout)
+        except InterruptedError:
+            return
+        now = time.monotonic()
+        if readable:
+            while True:
+                try:
+                    data, addr = self.udp.recvfrom(256)
+                except (BlockingIOError, InterruptedError):
+                    break
+                self._on_datagram(data, addr[0], now)
+        if self.httpd is not None and self.svc.idle_seconds() > self.a.idle_close_s:
+            self._close("not used for %d min" % (self.a.idle_close_s // 60))
+
+    def run(self):
+        while not self._stop:
+            self.step()
+        self._close("service stopping")
+        self.udp.close()
+
+    def stop(self):
+        self._stop = True
 
 
 def main(argv=None):
     a = build_parser().parse_args(argv)
+    if a.session_port in (25618, 25619, 15000, 51000):
+        raise SystemExit("that session port belongs to the robot's own teleop stack")
     svc = Service(a)
     Handler.svc = svc
-    httpd = ThreadingHTTPServer((a.listen_ip, a.port), Handler)
-    httpd.daemon_threads = True
-
-    def stop(*_):
-        threading.Thread(target=httpd.shutdown, daemon=True).start()
-
-    signal.signal(signal.SIGINT, stop)
-    signal.signal(signal.SIGTERM, stop)
-    log("control page on http://%s:%d/" % (a.listen_ip, a.port))
+    gate = Gate(svc, a)
+    signal.signal(signal.SIGINT, lambda *_: gate.stop())
+    signal.signal(signal.SIGTERM, lambda *_: gate.stop())
+    log("waiting for a headset on UDP %d; the page (port %d) opens when one connects" % (gate.session_port, a.port))
+    if a.standby:
+        try:
+            svc.start_bridge("test")
+        except (RuntimeError, OSError) as e:
+            log("could not start the bridge in test mode: %s" % e)
     try:
-        httpd.serve_forever()
+        gate.run()
     finally:
-        svc.stop_bridge()       # never leave a bridge feeding the robot without its control page
-        httpd.server_close()
+        svc.shutdown()          # never leave a bridge feeding the robot without its service
         log("stopped")
     return 0
 

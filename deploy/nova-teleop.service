@@ -1,0 +1,26 @@
+# Nova Teleop on the robot: waits for the headset, keeps the bridge in test mode,
+# opens the control page while a headset is connected.
+#
+# Install (start with the robot):
+#   sudo cp deploy/nova-teleop.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now nova-teleop
+# Remove:
+#   sudo systemctl disable --now nova-teleop && sudo rm /etc/systemd/system/nova-teleop.service
+#
+# Adjust User and WorkingDirectory to where this repository lives.
+[Unit]
+Description=Nova Teleop bridge and control page
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=agi
+WorkingDirectory=/home/agi/nova_teleop_bridge
+ExecStart=/usr/bin/python3 robot/teleop_service.py
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

@@ -27,6 +27,7 @@
   --radius: 12px;
 }
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 html { color-scheme: dark; }
 body {
   margin: 0; background: var(--bg); color: var(--text);
@@ -108,7 +109,31 @@ ul.how b { color: var(--text); font-weight: 600; }
   <div class="sub"><span id="conn">Connecting…</span></div>
 </header>
 
-<main>
+<main id="lock" hidden>
+  <section class="card" style="max-width:460px;margin:8vh auto 0;width:100%">
+    <h2>Locked</h2>
+    <h3 style="margin:0 0 6px;font-size:18px">Type the word shown in the headset</h3>
+    <p style="color:var(--text-muted);margin:0 0 16px">Nova Teleop on the PICO shows a four-letter word when it connects to this robot.</p>
+    <form id="f-unlock" autocomplete="off">
+      <label for="i-word">Four-letter word</label>
+      <input type="text" id="i-word" maxlength="4" autocapitalize="characters" spellcheck="false"
+             style="font-size:28px;letter-spacing:.4em;text-transform:uppercase;text-align:center;font-weight:600">
+      <div class="row" style="margin-top:14px"><button class="primary" type="submit">Unlock</button></div>
+      <div id="unlock-note"></div>
+    </form>
+  </section>
+</main>
+
+<main id="closed" hidden>
+  <section class="card" style="max-width:460px;margin:8vh auto 0;width:100%">
+    <h2>Closed</h2>
+    <h3 style="margin:0 0 6px;font-size:18px">This page is closed</h3>
+    <p style="color:var(--text-muted);margin:0">It opens when Nova Teleop on the headset connects to the robot. It closes when the headset
+      disconnects, or after 15 minutes without use. Connect again in the headset, then reload.</p>
+  </section>
+</main>
+
+<main id="app" hidden>
   <section class="card" aria-labelledby="h-robot">
     <h2 id="h-robot">Robot</h2>
     <div class="row" style="margin-bottom:14px">
@@ -139,11 +164,10 @@ ul.how b { color: var(--text); font-weight: 600; }
       <div class="num" id="n2">2</div>
       <div class="body">
         <h3>Connect the headset</h3>
-        <p>Open Nova Teleop on the PICO headset and pick this robot. <b>Test</b> only checks the stream. <b>Live</b> passes it to the robot.</p>
+        <p>The headset link starts in <b>test mode</b>: the stream is checked but nothing reaches the robot. <b>Live</b> passes it to the robot.</p>
         <div class="row">
-          <button id="b-bridge-test">Start in test mode</button>
-          <button class="primary" id="b-bridge-live">Start live</button>
-          <button class="danger" id="b-bridge-stop">Stop headset link</button>
+          <button class="primary" id="b-bridge-live">Go live</button>
+          <button class="danger" id="b-bridge-stop">Back to test mode</button>
           <span class="pill" id="p-bridge">Headset link: …</span>
         </div>
         <div class="grid" style="margin-top:14px">
@@ -236,6 +260,7 @@ async function post(path, body) {
     const r = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json", "X-Nova-Teleop": "1" },
                                   body: JSON.stringify(body || {}) });
     const j = await r.json().catch(() => ({}));
+    if (r.status === 401) { show("lock"); return null; }
     if (!r.ok) { toast(j.error || ("Request failed (" + r.status + ")")); return null; }
     return j;
   } catch (e) { toast("The robot did not answer."); return null; }
@@ -245,7 +270,8 @@ async function post(path, body) {
 function render(s) {
   last = s;
   const r = s.robot, tr = s.transition, busy = tr && !tr.done, b = s.bridge, link = b.link || null;
-  $("conn").textContent = "Updated " + new Date(s.time * 1000).toLocaleTimeString();
+  $("conn").textContent = s.closes_in < 120 ? "Page closes in " + s.closes_in + " s unless you use it"
+                                             : "Updated " + new Date(s.time * 1000).toLocaleTimeString();
 
   if (!r.reachable) pill($("p-state"), "State: no answer from the robot", "bad");
   else pill($("p-state"), "State: " + (r.teleop ? "Teleoperation" : r.state) + (r.status ? " · " + r.status.replace("IN_", "").toLowerCase() : ""),
@@ -272,9 +298,8 @@ function render(s) {
   // step 2
   const live = b.running && b.mode === "live";
   $("n2").className = "num" + (live && link && link.state === "active" ? " done" : "");
-  $("b-bridge-test").disabled = b.running;
-  $("b-bridge-live").disabled = b.running;
-  $("b-bridge-stop").disabled = !b.running || !b.managed;
+  $("b-bridge-live").disabled = live || (b.running && !b.managed);
+  $("b-bridge-stop").disabled = !live || !b.managed;
   pill($("p-bridge"), "Headset link: " + (!b.running ? "off" : live ? "LIVE" : "test mode"), !b.running ? "" : live ? "live" : "warn");
   $("s-sender").textContent = link && link.sender ? link.sender : "–";
   $("s-rx").textContent = link ? link.rx_hz + " / s" : "–";
@@ -298,21 +323,46 @@ function fillSettings(s) {
   $("c-head").checked = d.cameras.head; $("c-keep").checked = d.keep_local_copy;
 }
 
+function show(which) {
+  for (const id of ["lock", "closed", "app"]) $(id).hidden = id !== which;
+  if (which !== "app") { settingsLoaded = false; $("conn").textContent = which === "lock" ? "Locked" : "Closed"; }
+  if (which === "lock" && document.activeElement !== $("i-word")) $("i-word").focus();
+}
 async function refresh() {
   try {
     const r = await fetch("/api/status", { cache: "no-store" });
-    render(await r.json()); failures = 0;
+    failures = 0;
+    if (r.status === 401) { show("lock"); return; }
+    const s = await r.json();
+    show("app"); render(s);
   } catch (e) {
-    if (++failures > 1) $("conn").textContent = "No connection to the robot";
+    if (++failures > 1) show("closed");       // the robot stopped serving the page
   }
 }
+$("f-unlock").onsubmit = async ev => {
+  ev.preventDefault();
+  try {
+    const r = await fetch("/api/unlock", { method: "POST", headers: { "Content-Type": "application/json", "X-Nova-Teleop": "1" },
+                                           body: JSON.stringify({ word: $("i-word").value }) });
+    const j = await r.json().catch(() => ({}));
+    if (r.ok) { $("i-word").value = ""; note($("unlock-note"), ""); refresh(); }
+    else note($("unlock-note"), j.error || "Could not unlock.", "err");
+  } catch (e) { show("closed"); }
+};
+// Using the page keeps it open: tell the robot at most every 20 s.
+let lastPing = 0;
+function activity() {
+  if ($("app").hidden || Date.now() - lastPing < 20000) return;
+  lastPing = Date.now();
+  fetch("/api/ping", { method: "POST", headers: { "X-Nova-Teleop": "1" } }).catch(() => {});
+}
+for (const ev of ["pointerdown", "keydown", "wheel", "touchstart"]) window.addEventListener(ev, activity, { passive: true });
 
 $("b-teleop-start").onclick = () => {
   if (confirm("Switch the robot to teleoperation mode?\n\nMake sure it is standing or hung up safely and nobody is within reach of its arms."))
     post("/api/teleop/start");
 };
 $("b-teleop-stop").onclick = () => { if (confirm("Leave teleoperation mode? The headset link is stopped first.")) post("/api/teleop/stop"); };
-$("b-bridge-test").onclick = () => post("/api/bridge/start", { mode: "test" });
 $("b-bridge-live").onclick = () => {
   if (confirm("Start the headset link LIVE?\n\nThe robot will follow the operator once they calibrate and hold both grips. Keep the emergency stop within reach."))
     post("/api/bridge/start", { mode: "live" });

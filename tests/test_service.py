@@ -1,6 +1,7 @@
 """Control page service against a stand-in robot (nothing here talks to the real robot)."""
 import json
 import os
+import socket
 import tempfile
 import threading
 import time
@@ -9,6 +10,7 @@ import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from robot import session
 from robot import teleop_service as ts
 from tests.util import free_udp_port
 
@@ -62,36 +64,141 @@ class TestService(unittest.TestCase):
         args = ts.build_parser().parse_args([
             "--listen-ip", "127.0.0.1", "--port", "0", "--settings", os.path.join(cls.tmp.name, "s.json"),
             "--run-dir", os.path.join(cls.tmp.name, "run"), "--sm-url", url, "--skillpilot-url", url,
-            "--robot-input-port", str(free_udp_port(39400)), "--poll-s", "0.1", "--bridge-arg=--no-discovery"])
+            "--robot-input-port", str(free_udp_port(39400)), "--poll-s", "0.1", "--bridge-arg=--no-discovery",
+            "--session-port", "0", "--no-standby", "--max-tries", "3", "--lockout-s", "0.4"])
+        cls.args = args
         cls.svc = ts.Service(args)
         ts.Handler.svc = cls.svc
-        cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), ts.Handler)
-        threading.Thread(target=cls.httpd.serve_forever, daemon=True).start()
-        cls.base = "http://127.0.0.1:%d" % cls.httpd.server_address[1]
+        cls.gate = ts.Gate(cls.svc, args)
+        cls.gate_thread = threading.Thread(target=cls.gate.run, daemon=True)
+        cls.gate_thread.start()
+        cls.udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        cls.sid = 1000
 
     @classmethod
     def tearDownClass(cls):
-        cls.svc.stop_bridge()
-        cls.httpd.shutdown()
+        cls.svc.shutdown()
+        cls.gate.stop()
+        cls.gate_thread.join(timeout=5)
+        cls.udp.close()
         cls.robot.shutdown()
         cls.tmp.cleanup()
 
     def setUp(self):
         FakeRobot.state, FakeRobot.refuse = "Manual", False
         self.svc.transition = None
+        self.args.idle_close_s = 900.0
+        self.connect("LAMP")
+        self.cookie = ""
+        code, _ = self.post("/api/unlock", {"word": "lamp"})
+        self.assertEqual(code, 200)
+
+    # ---- helpers ----
+    def say(self, kind, word="LAMP", sid=None):
+        self.udp.sendto(session.pack(kind, self.sid if sid is None else sid, word),
+                        ("127.0.0.1", self.gate.session_port))
+
+    def connect(self, word):
+        """A new headset connection: the page opens (or re-keys) with this word."""
+        type(self).sid += 1
+        self.say(session.HELLO, word)
+        self.assertTrue(wait_for(lambda: self.gate.page_open() and self.svc.word == word))
+        self.base = "http://127.0.0.1:%d" % self.gate.web_port
 
     def get(self, path):
-        with urllib.request.urlopen(self.base + path, timeout=5) as r:
+        req = urllib.request.Request(self.base + path, headers={"Cookie": self.cookie})
+        with urllib.request.urlopen(req, timeout=5) as r:
             return r.read()
 
     def post(self, path, body=None, header=True):
-        req = urllib.request.Request(self.base + path, data=json.dumps(body or {}).encode(), method="POST",
-                                     headers={"X-Nova-Teleop": "1"} if header else {})
+        h = {"Cookie": self.cookie}
+        if header:
+            h["X-Nova-Teleop"] = "1"
+        req = urllib.request.Request(self.base + path, data=json.dumps(body or {}).encode(), method="POST", headers=h)
         try:
             with urllib.request.urlopen(req, timeout=5) as r:
+                c = r.headers.get("Set-Cookie")
+                if c:
+                    self.cookie = c.split(";")[0]
                 return r.status, json.loads(r.read())
         except urllib.error.HTTPError as e:
             return e.code, json.loads(e.read())
+
+    def page_refuses_connections(self):
+        try:
+            urllib.request.urlopen(self.base + "/", timeout=2).read()
+            return False
+        except OSError:
+            return True
+
+    # ---- page access ----
+    def test_locked_until_the_word_is_typed(self):
+        self.cookie = ""
+        self.assertIn(b"Nova Teleop", self.get("/"))                     # lock screen is served
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            self.get("/api/status")
+        self.assertEqual(cm.exception.code, 401)
+        self.assertEqual(self.post("/api/teleop/start")[0], 401)
+        self.assertEqual(FakeRobot.state, "Manual")
+        self.assertEqual(self.post("/api/unlock", {"word": "NOPE"})[0], 403)
+        self.assertEqual(self.post("/api/unlock", {"word": " Lamp "})[0], 200)
+        self.assertTrue(self.status()["robot"] is not None)
+
+    def test_wrong_words_cause_a_pause(self):
+        self.cookie = ""
+        for _ in range(3):
+            self.assertEqual(self.post("/api/unlock", {"word": "NOPE"})[0], 403)
+        code, r = self.post("/api/unlock", {"word": "LAMP"})             # right word, but paused
+        self.assertEqual(code, 403)
+        self.assertIn("wait", r["error"])
+        time.sleep(0.5)
+        self.assertEqual(self.post("/api/unlock", {"word": "LAMP"})[0], 200)
+
+    def test_goodbye_closes_the_page(self):
+        self.say(session.BYE)
+        self.assertTrue(wait_for(lambda: not self.gate.page_open()))
+        self.assertTrue(self.page_refuses_connections())
+        self.say(session.HELLO)                                          # a late hello of the same connection
+        time.sleep(0.7)
+        self.assertFalse(self.gate.page_open())
+
+    def test_new_connection_needs_the_new_word(self):
+        old = self.cookie
+        self.connect("FERN")
+        self.cookie = old
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            self.get("/api/status")
+        self.assertEqual(cm.exception.code, 401)
+        self.assertEqual(self.post("/api/unlock", {"word": "LAMP"})[0], 403)
+        self.assertEqual(self.post("/api/unlock", {"word": "FERN"})[0], 200)
+
+    def test_idle_page_closes_and_use_keeps_it_open(self):
+        self.args.idle_close_s = 1.2
+        for _ in range(4):                                               # 2 s of "use"
+            time.sleep(0.5)
+            self.assertEqual(self.post("/api/ping")[0], 200)
+        self.assertTrue(self.gate.page_open())
+        for _ in range(3):                                               # status polling is not "use"
+            time.sleep(0.3)
+            try:
+                self.get("/api/status")
+            except OSError:
+                pass
+        self.assertTrue(wait_for(lambda: not self.gate.page_open(), timeout=4))
+        self.say(session.HELLO)                                          # the same connection does not reopen it
+        time.sleep(0.7)
+        self.assertFalse(self.gate.page_open())
+
+    def test_garbage_datagrams_are_ignored(self):
+        self.say(session.BYE)
+        self.assertTrue(wait_for(lambda: not self.gate.page_open()))
+        good = session.pack(session.HELLO, 77, "LAMP")
+        for bad in (b"", good[:-1], good[:-1] + bytes([good[-1] ^ 1]), b"XXXX" + good[4:]):
+            self.udp.sendto(bad, ("127.0.0.1", self.gate.session_port))
+        with self.assertRaises(ValueError):
+            session.pack(session.HELLO, 1, "AB1D")
+        time.sleep(0.7)
+        self.assertFalse(self.gate.page_open())
 
     def status(self):
         return json.loads(self.get("/api/status"))
@@ -135,7 +242,7 @@ class TestService(unittest.TestCase):
             self.assertTrue(s["bridge"]["running"])
             self.assertEqual(s["bridge"]["mode"], "test")
             self.assertEqual(s["bridge"]["link"]["mode"], "dry-run")
-            self.assertEqual(self.post("/api/bridge/start", {"mode": "live"})[0], 409)   # already running
+            self.assertEqual(self.post("/api/bridge/start", {"mode": "test"})[0], 409)   # already in test mode
         finally:
             self.assertEqual(self.post("/api/bridge/stop")[0], 200)
         self.assertFalse(self.status()["bridge"]["running"])

@@ -54,6 +54,9 @@ BOARDS = (("head", "Head board", "10.42.10.10"), ("main", "Main controller", "10
 
 DEFAULT_SETTINGS = {
     "bridge": {"sender_ip": "", "port": 39500},
+    # Fingers: "robot" = the robot's built-in finger control; "two" = thumb + index;
+    # "three" = thumb + index + middle. close_percent = how far they close.
+    "hand": {"mode": "robot", "close_percent": 100},
     "data_collection": {
         "enabled": False,
         "task": "",
@@ -67,6 +70,18 @@ DEFAULT_SETTINGS = {
     },
 }
 UPLOAD_FORMATS = ("lerobot", "raw")
+HAND_MODES = ("robot", "two", "three")
+HAND_CONFIG = os.path.join(ROOT, "config", "hand.json")
+ROS_SETUP = "/opt/ros/jazzy/setup.bash"
+ROS_DOMAIN_ID = "232"
+
+
+def hand_verified():
+    try:
+        with open(HAND_CONFIG) as fh:
+            return bool(json.load(fh).get("verified"))
+    except (OSError, ValueError):
+        return False
 
 
 def log(msg):
@@ -101,6 +116,10 @@ def validate_settings(s):
         raise ValueError("server address must start with http:// or https://")
     if not 1 <= d["max_spool_gb"] <= 2000:
         raise ValueError("temporary storage limit must be 1..2000 GB")
+    if s["hand"]["mode"] not in HAND_MODES:
+        raise ValueError("finger mode must be one of %s" % (HAND_MODES,))
+    if not 10 <= s["hand"]["close_percent"] <= 100:
+        raise ValueError("finger closing must be 10..100 percent")
     port = s["bridge"]["port"]
     if not 1024 <= port <= 65535 or port in (25618, 25619, 15000, 51000):
         raise ValueError("bridge port must be 1024..65535 and not one of the robot's own teleop ports")
@@ -277,6 +296,9 @@ class Service:
     def start_bridge(self, mode):
         if mode not in ("test", "live"):
             raise ValueError("mode must be 'test' or 'live'")
+        if mode == "live" and self.settings["hand"]["mode"] != "robot" and not hand_verified():
+            raise RuntimeError("finger control has not been checked on this robot yet; "
+                               "choose the robot's built-in finger control in Settings, or run the finger test")
         if self.bridge_running():
             if self.bridge_mode == mode:
                 raise RuntimeError("the headset link is already in %s mode" % mode)
@@ -290,6 +312,12 @@ class Service:
                 cmd += ["--robot-input", "--robot-input-host", self.a.robot_input_host,
                         "--robot-input-port", str(self.a.robot_input_port)]
             cmd += self.a.bridge_arg
+            h = self.settings["hand"]
+            if mode == "live" and h["mode"] != "robot":
+                cmd += ["--fingers", h["mode"], "--finger-amount", "%.2f" % (h["close_percent"] / 100.0)]
+                # finger commands go over ROS 2: the bridge needs the robot's ROS environment
+                cmd = ["bash", "-c", 'source "$0" && export ROS_DOMAIN_ID="$1" && shift 2 && exec "$@"',
+                       ROS_SETUP, ROS_DOMAIN_ID] + cmd
             logfh = open(self.bridge_log, "ab")
             self.bridge = subprocess.Popen(cmd, stdout=logfh, stderr=subprocess.STDOUT, cwd=ROOT)
             logfh.close()
@@ -356,6 +384,7 @@ class Service:
         snap["transition"] = tr
         snap["bridge"] = self._bridge_status()
         snap["settings"] = settings
+        snap["hand_verified"] = hand_verified()
         snap["closes_in"] = max(0, int(self.a.idle_close_s - self.idle_seconds()))
         snap["time"] = time.time()
         return snap

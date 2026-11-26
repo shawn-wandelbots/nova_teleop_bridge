@@ -182,6 +182,30 @@ flowchart LR
 Two upload choices are foreseen: convert to the LeRobot format on the robot, or upload the
 raw recording and convert on the server.
 
+## Fingers
+
+The robot's own teleop software closes the whole hand in a fixed way. This project can drive
+the fingers itself instead, so that the index trigger closes **only 2 or 3 fingers** and the
+others stay open.
+
+```mermaid
+flowchart LR
+    T["Index trigger<br/>0 to 100 %"] --> M{"Grip held?"}
+    M -- yes --> F["Chosen fingers move<br/>between open and closed"]
+    M -- no --> K["Fingers keep<br/>their position"]
+    F --> H(("Hand"))
+    K --> H
+```
+
+- Choose on the control page: robot's built-in control, **thumb + index**, or
+  **thumb + index + middle**, and how far they close.
+- Fingers move at a limited speed, starting from where they really are.
+- The open and closed poses live in `config/hand.json`. They are marked **not verified**
+  until they have been checked on the robot with `tools/hand_test.py`; until then going live
+  with our finger control is refused.
+- The robot's built-in finger control must be switched off when ours is used, or two programs
+  command the same fingers.
+
 ## What is inside
 
 | Path | What it is |
@@ -196,6 +220,9 @@ raw recording and convert on the server.
 | `robot/discovery.py` | Lets the headset app find the robot on the network |
 | `teleop_common/` | Headset-to-bridge packet format, coordinate maths |
 | `config/transform.json` | Every assumption about axes, scale and origin, in one file |
+| `robot/hand_control.py` | Finger mapping: trigger to the chosen fingers |
+| `config/hand.json` | Open and closed finger poses |
+| `tools/hand_test.py` | Reads the hand, or moves one finger slowly, for a first check |
 | `tools/static_pose_test.py` | Sends a still pose with tiny, slow hand moves for a first careful test |
 | `tools/pcap_to_cap.py` | Turns a network capture into a test file |
 | `pc/` | Optional sender for a PC running XRoboToolkit (an alternative to the headset app) |
@@ -236,6 +263,7 @@ recommended path.
 | ✅ | Checks, watchdog and sender lock are covered by tests |
 | ❌ | **The bridge has not driven the real robot yet** |
 | ❌ | The axis mapping between the headset app and the robot (`config/transform.json`) is still marked provisional |
+| ❌ | Our finger control has not moved the real fingers yet; its poses are provisional |
 | ❌ | Data collection: only the settings exist |
 
 ## First test on a real robot

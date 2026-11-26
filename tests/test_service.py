@@ -247,11 +247,25 @@ class TestService(unittest.TestCase):
             self.assertEqual(self.post("/api/bridge/stop")[0], 200)
         self.assertFalse(self.status()["bridge"]["running"])
 
+    def test_unchecked_finger_control_cannot_go_live(self):
+        self.assertFalse(self.status()["hand_verified"])
+        self.assertEqual(self.post("/api/settings", {"hand": {"mode": "two", "close_percent": 60},
+                                                     "bridge": {"port": free_udp_port(39470)}})[0], 200)
+        try:
+            code, r = self.post("/api/bridge/start", {"mode": "live"})
+            self.assertEqual(code, 409)
+            self.assertIn("finger", r["error"])
+            self.assertFalse(self.status()["bridge"]["running"])
+        finally:
+            self.post("/api/settings", {"hand": {"mode": "robot"}})
+
     def test_settings_are_validated_and_kept(self):
         code, r = self.post("/api/settings", {"data_collection": {"server_url": "ftp://x"}})
         self.assertEqual(code, 409)
         code, r = self.post("/api/settings", {"bridge": {"port": 25618}})
         self.assertEqual(code, 409)
+        self.assertEqual(self.post("/api/settings", {"hand": {"mode": "fist"}})[0], 409)
+        self.assertEqual(self.post("/api/settings", {"hand": {"close_percent": 5}})[0], 409)
         code, r = self.post("/api/settings", {"data_collection": {
             "server_url": "https://data.example", "upload_format": "raw", "enabled": True, "task": "t",
             "cameras": {"head": False}, "unknown": 1}})

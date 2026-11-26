@@ -155,6 +155,12 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--robot-input-host", default="127.0.0.1", help="where hal_remote listens (default %(default)s)")
     ap.add_argument("--robot-input-port", type=int, default=ROBOT_INPUT_PORT,
                     help="only change this for tests against a stand-in listener")
+    ap.add_argument("--fingers", default=None, metavar="two|three|all",
+                    help="with --robot-input: drive the fingers ourselves; the index trigger closes only these "
+                         "(thumb+index, thumb+index+middle, or all). Needs the robot's ROS 2 environment, and the "
+                         "robot's built-in finger control must be off")
+    ap.add_argument("--finger-amount", type=float, default=1.0, help="how far the fingers close, 0..1")
+    ap.add_argument("--hand-config", default=os.path.join(os.path.dirname(DEFAULT_CONFIG), "hand.json"))
     ap.add_argument("--status-file", default=None, metavar="FILE",
                     help="write a small JSON status snapshot here every second (read by the web UI)")
     ap.add_argument("--listen-ip", default="0.0.0.0")
@@ -193,6 +199,8 @@ def main(argv=None) -> int:
             ap.error("discovery port %d belongs to the robot's own teleop stack" % a.discovery_port)
         if not 1024 <= a.discovery_port <= 65535 or a.discovery_port == a.port:
             ap.error("--discovery-port must be 1024..65535 and differ from --port")
+    if a.fingers and not a.robot_input:
+        ap.error("--fingers needs --robot-input")
     if a.resync_ms <= a.watchdog_ms:
         ap.error("--resync-ms must be larger than --watchdog-ms")
     live = a.publish or a.robot_input
@@ -221,6 +229,11 @@ def main(argv=None) -> int:
         publisher = RobotInputPublisher(a.robot_input_host, a.robot_input_port)
     else:
         publisher = RosPublisher(a.allow_other_publishers) if a.publish else DryRunPublisher()
+
+    hand = None
+    if a.fingers:
+        from robot import hand_control  # noqa: PLC0415
+        hand = hand_control.HandPublisher(hand_control.load_config(a.hand_config), a.fingers, a.finger_amount, log=log)
 
     # Discovery responder (docs/DISCOVERY.md). Read-only: it reports mode and lock state and
     # never touches the bridge core. A port that cannot be bound only disables discovery.
@@ -255,7 +268,9 @@ def main(argv=None) -> int:
         snap = {"t": time.time(), "mode": mode_name.lower(), "state": "active" if core.active else "stopped",
                 "sender": core.sender_ip, "listen_port": a.port, "sent": publisher.count,
                 "send_errors": getattr(publisher, "errors", 0), "watchdog_trips": core.stats["watchdog_trips"],
-                "last_reject": core.last_reason, "config_status": cfg.get("status", "?")}
+                "last_reject": core.last_reason, "config_status": cfg.get("status", "?"),
+                "fingers": a.fingers or "", "finger_commands": hand.count if hand else 0,
+                "hand_found": bool(hand and hand.ready())}
         snap.update(rates)
         try:
             tmp = a.status_file + ".tmp"
@@ -301,6 +316,8 @@ def main(argv=None) -> int:
             core.tick(now)
             if newest is not None and core.active and not stop["flag"]:
                 publisher.publish(newest)
+                if hand is not None:
+                    hand.update(*newest.hands)
                 core.stats["out"] += 1
                 t_ns = time.time_ns()
                 lat_ms.append((t_ns - newest.t_send_ns) / 1e6)
@@ -344,6 +361,9 @@ def main(argv=None) -> int:
             recorder.close()
         total = publisher.count
         publisher.close()
+        if hand is not None:
+            log("finger control: %d commands sent" % hand.count)
+            hand.close()
         s = core.stats
         log("exit (%s): rx=%d valid=%d %s=%d rejects=%s watchdog_trips=%d" % (
             signal.Signals(stop["sig"]).name if stop["sig"] else "done", s["rx"], s["valid"],

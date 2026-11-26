@@ -1,0 +1,26 @@
+{
+  "_readme": [
+    "Finger control for the 10-motor hands (O10). Motor positions are 0..4095.",
+    "Motor order per hand: thumb_rotation, thumb_wiggles, thumb_bent, index_wiggles, index_bent,",
+    "middle_bent, ring_wiggles, ring_bent, pinky_wiggles, pinky_bent.",
+    "'open' is the pose with the trigger released, 'closed' the pose with the trigger fully pressed.",
+    "Only the motors of the selected fingers move between the two; all others stay at 'open'.",
+    "STATUS: the poses below are PROVISIONAL (taken from the vendor configuration, not yet checked",
+    "on the robot). Live finger control refuses to start until 'verified' is true."
+  ],
+  "verified": false,
+  "state_topic": "/motion/control/hand_joint_state",
+  "command_topic": "/motion/control/hand_joint_command",
+  "expected_hand": "O10Hand",
+  "max_speed_per_s": 6000,
+  "publish_hz": 50,
+  "grip_hold_threshold": 0.5,
+  "left": {
+    "open":   [3200, 4000, 3200, 4000, 4000, 4000, 4000, 4000, 0, 4000],
+    "closed": [722, 495, 454, 0, 1423, 1423, 2000, 0, 2000, 0]
+  },
+  "right": {
+    "open":   [3200, 0, 3200, 0, 4000, 4000, 500, 4000, 4095, 4000],
+    "closed": [3278, 3505, 454, 4000, 1423, 1423, 2000, 0, 2000, 0]
+  }
+}

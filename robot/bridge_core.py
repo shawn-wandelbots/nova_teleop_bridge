@@ -13,7 +13,7 @@ from typing import List, Optional, Tuple
 
 from robot import a3_proto
 from teleop_common import wire
-from teleop_common.transform import FrameTransform, q_norm
+from teleop_common.transform import FrameTransform, q_mul, q_norm, q_rotate
 
 TIMESTAMP_MODES = ("unix_ms", "unix_us", "unix_ns", "sender_ns", "sdk_ns", "const_u32max")
 
@@ -76,10 +76,18 @@ class BridgeCore:
             raise ValueError("robot_frame_quaternion must be one of %s" % (a3_proto.QUAT_MODES,))
         # "first_head": positions are measured from where the head was when the stream started
         # (the vendor headset app does this: head height is z = 0).  "fixed": use them as they come.
+        # "body": the reference is the operator's own body: positions are measured from the
+        # tracked head joint and turned so that the operator faces +x.  It is taken when the
+        # stream starts and again every time X+Y+A+B is pressed with both grips released (the
+        # robot's calibration gesture).  Needs body tracking.  Head and controller positions are
+        # then taken from the body's head and hand joints, because the headset reports the body
+        # and the devices in frames that do not always agree.
         self.origin_mode = o.get("origin", "fixed")
-        if self.origin_mode not in ("fixed", "first_head"):
-            raise ValueError("origin must be 'fixed' or 'first_head'")
+        if self.origin_mode not in ("fixed", "first_head", "body"):
+            raise ValueError("origin must be 'fixed', 'first_head' or 'body'")
         self._origin: Optional[Tuple[float, float, float]] = None
+        self._yaw_q = (0.0, 0.0, 0.0, 1.0)       # rotation that turns the operator's heading to +x
+        self._combo_was_down = False
         self._frame_index = 0
         self._last_ts = 0
 
@@ -185,7 +193,32 @@ class BridgeCore:
                 return self._reject("bad_quat")
 
         # ---- origin ---------------------------------------------------------------------
-        if self.origin_mode == "first_head":
+        reanchored = False
+        if self.origin_mode == "body":
+            if f.body is None:
+                return self._reject("no_body")
+            raw = [self.transform.pose(p)[0] for p in f.body]
+            combo = (f.flags & wire.FLAG_LEFT and f.flags & wire.FLAG_RIGHT
+                     and f.left.key_one and f.left.key_two and f.right.key_one and f.right.key_two)
+            grips_free = f.left.grip < 0.1 and f.right.grip < 0.1
+            pressed = bool(combo) and not self._combo_was_down and grips_free
+            self._combo_was_down = bool(combo)
+            if stale_stream or self._origin is None or pressed:
+                # heading: the direction the shoulders and hips face, flattened to the floor
+                lx = raw[16][0] - raw[17][0] + raw[1][0] - raw[2][0]
+                ly = raw[16][1] - raw[17][1] + raw[1][1] - raw[2][1]
+                if math.hypot(lx, ly) < 0.05:
+                    return self._reject("no_heading")
+                yaw = math.atan2(-lx, ly)
+                self._yaw_q = (0.0, 0.0, math.sin(-yaw / 2.0), math.cos(-yaw / 2.0))
+                self._origin = raw[15]
+                self._baseline = None            # the frame moved on purpose: not a tracking jump
+                reanchored = True
+                self.stats["reanchors"] += 1
+                self._log("reference set to the operator's body (%s): heading %.0f deg"
+                          % ("X+Y+A+B" if pressed else "stream start", math.degrees(yaw)))
+            ox, oy, oz = self._origin
+        elif self.origin_mode == "first_head":
             if stale_stream or self._origin is None:
                 if not f.flags & wire.FLAG_HEAD:
                     return self._reject("no_head")
@@ -194,9 +227,14 @@ class BridgeCore:
         else:
             ox = oy = oz = 0.0
 
+        yaw_q = self._yaw_q if self.origin_mode == "body" else None
+
         def tf(pose):
             p, q = self.transform.pose(pose)
-            return (p[0] - ox, p[1] - oy, p[2] - oz), q
+            p = (p[0] - ox, p[1] - oy, p[2] - oz)
+            if yaw_q is not None:
+                p, q = q_rotate(yaw_q, p), q_mul(yaw_q, q)
+            return p, q
 
         body_joints: List[a3_proto.Joint] = []
         positions: List[Tuple[float, float, float]] = []
@@ -268,14 +306,19 @@ class BridgeCore:
         if self.robot_frame:
             devices = []
             poses = {self.left_code: f.left_pose, self.right_code: f.right_pose}
+            body_pos = {j.code: j.pos for j in body_joints}
             for c in controllers:
                 p, q = tf(poses[c.code])
+                if self.origin_mode == "body":
+                    p = body_pos[22 if c.code == self.left_code else 23]
                 devices.append(a3_proto.DeviceInput(
                     device_type=a3_proto.DEVICE_LEFT if c.code == self.left_code else a3_proto.DEVICE_RIGHT,
                     axis_click=c.axis_click, axis_x=c.axis_x, axis_y=c.axis_y, index_trig=c.index_trig,
                     hand_trig=c.hand_trig, key_one=c.key_one, key_two=c.key_two, pos=p, quat=q))
             devices.sort(key=lambda d: d.device_type)
             p, q = tf(f.head)
+            if self.origin_mode == "body":
+                p = body_pos[15]
             devices.append(a3_proto.DeviceInput(device_type=a3_proto.DEVICE_HEAD, pos=p, quat=q))
             # The robot drops a datagram whose timestamp it has already seen: keep it rising.
             ts_ms = max(self._wall_ns() // 1_000_000, self._last_ts + 1)

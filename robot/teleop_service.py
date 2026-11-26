@@ -289,7 +289,8 @@ class Service:
             except (OSError, ValueError) as e:
                 err = "no answer from the robot: %s" % e
             with self.lock:
-                self.transition.update(done=True, error=err, finished=time.time())
+                if self.transition is not None:
+                    self.transition.update(done=True, error=err, finished=time.time())
             log("teleop %s -> %s" % (action, err or "ok"))
 
         log("teleop %s requested" % action)

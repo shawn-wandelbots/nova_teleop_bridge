@@ -232,8 +232,10 @@ Orientations are packed into 32 bits. The exact layout is documented at the top 
 `RobotFrameData` section in [`robot/a3_proto.py`](robot/a3_proto.py). The robot drops packets
 that repeat a timestamp, so the bridge makes sure timestamps always rise.
 
-Positions use: **x forward, y left, z up, in metres**, measured from where the operator's head
-was when the stream started.
+Positions use: **x forward, y left, z up, in metres**, measured from the operator's own head
+and turned so that the operator faces forward. This reference is taken when the stream starts
+and **again every time X + Y + A + B is pressed with both grips released**, so calibrating
+also tells the bridge "this is where I stand and which way I face now".
 
 A second live mode, `--publish`, writes straight to the robot's internal ROS 2 topics instead.
 It skips the robot's input program and with it the button rules above, so it is not the

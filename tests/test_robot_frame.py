@@ -179,3 +179,101 @@ class TestLivePath(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _xrt(rx, ry, rz):
+    """robot-frame point -> the headset frame used on the wire (default transform)."""
+    return (-ry, rz, -rx)
+
+
+def _body_at(cx, cy, heading_deg, head_z=1.7):
+    """24 joints of an upright operator standing at (cx, cy), facing heading_deg (robot frame)."""
+    h = math.radians(heading_deg)
+    fwd, left = (math.cos(h), math.sin(h)), (-math.sin(h), math.cos(h))
+    side = {1: 0.1, 2: -0.1, 16: 0.2, 17: -0.2, 22: 0.25, 23: -0.25}      # metres to the left
+    front = {22: 0.3, 23: 0.3}                                             # hands held forward
+    out = []
+    for i in range(24):
+        s, f = side.get(i, 0.0), front.get(i, 0.0)
+        z = head_z if i == 15 else 1.0
+        out.append(_xrt(cx + left[0] * s + fwd[0] * f, cy + left[1] * s + fwd[1] * f, z) + (0.0, 0.0, 0.0, 1.0))
+    return out
+
+
+class TestBodyReference(unittest.TestCase):
+    def harness(self):
+        return robot_frame_harness(origin="body")
+
+    def send(self, h, body, xyab=False, grip=0.0):
+        def mut(f):
+            f.body = body
+            f.left.key_one = f.left.key_two = f.right.key_one = f.right.key_two = xyab
+            f.left.grip = f.right.grip = grip
+        out = h.send(mutate=mut)
+        self.assertIsNotNone(out, h.core.last_reason)
+        return pb.decode_robot_frame(out.robot_frame)
+
+    def walk(self, h, x, y, heading, steps=10, **kw):
+        """Move there over several frames, as a person would (no tracking jump)."""
+        f = None
+        for i in range(1, steps + 1):
+            k = i / steps
+            f = self.send(h, _body_at(x * k, y * k, heading * k), **kw)
+        return f
+
+    def check_centred(self, f):
+        """Head joint at the origin, operator facing +x (left shoulder on +y, hands in front)."""
+        j = {x.code: x.pos for x in f.body}
+        for v in j[15]:
+            self.assertAlmostEqual(v, 0.0, places=5)
+        self.assertAlmostEqual(j[16][0], 0.0, places=5)
+        self.assertAlmostEqual(j[16][1], 0.2, places=5)
+        self.assertAlmostEqual(j[22][0], 0.3, places=5)
+        self.assertAlmostEqual(j[22][1], 0.25, places=5)
+        self.assertAlmostEqual(j[0][2], -0.7, places=5)
+
+    def test_stream_start_sets_the_reference_from_the_body(self):
+        f = self.send(self.harness(), _body_at(3.0, -2.0, 40.0))
+        self.check_centred(f)
+
+    def test_devices_sit_on_the_body_joints(self):
+        h = self.harness()
+
+        def far_away(fr):
+            fr.body = _body_at(3.0, -2.0, 40.0)
+            fr.head = (50.0, 60.0, 70.0, 0.0, 0.0, 0.0, 1.0)       # devices in some other frame
+            fr.left_pose = fr.right_pose = fr.head
+        f = pb.decode_robot_frame(h.send(mutate=far_away).robot_frame)
+        j = {x.code: x.pos for x in f.body}
+        self.assertEqual([d.pos for d in f.devices], [j[22], j[23], j[15]])
+
+    def test_moving_does_not_move_the_reference(self):
+        h = self.harness()
+        self.send(h, _body_at(0.0, 0.0, 0.0))
+        f = self.send(h, _body_at(0.1, 0.0, 0.0))
+        self.assertAlmostEqual({x.code: x.pos for x in f.body}[15][0], 0.1, places=5)
+
+    def test_xyab_sets_a_new_reference(self):
+        h = self.harness()
+        self.send(h, _body_at(0.0, 0.0, 0.0))
+        moved = _body_at(0.15, 0.1, 25.0)
+        f = self.walk(h, 0.15, 0.1, 25.0)
+        self.assertNotAlmostEqual({x.code: x.pos for x in f.body}[16][0], 0.0, places=2)   # turned, old reference
+        self.check_centred(self.send(h, moved, xyab=True))
+        self.check_centred(self.send(h, moved, xyab=True))            # holding the buttons changes nothing more
+        self.check_centred(self.send(h, moved))
+        self.assertEqual(h.core.stats["reanchors"], 2)
+
+    def test_xyab_is_ignored_while_the_grips_are_held(self):
+        h = self.harness()
+        self.send(h, _body_at(0.0, 0.0, 0.0))
+        self.walk(h, 0.15, 0.1, 25.0, grip=1.0)
+        f = self.send(h, _body_at(0.15, 0.1, 25.0), xyab=True, grip=1.0)
+        self.assertNotAlmostEqual({x.code: x.pos for x in f.body}[15][0], 0.0, places=2)
+        self.assertEqual(h.core.stats["reanchors"], 1)
+
+    def test_a_big_step_with_xyab_is_not_treated_as_a_tracking_jump(self):
+        h = self.harness()
+        self.send(h, _body_at(0.0, 0.0, 0.0))
+        self.walk(h, 0.2, 0.2, 170.0, steps=40)
+        self.check_centred(self.send(h, _body_at(0.2, 0.2, 170.0), xyab=True))

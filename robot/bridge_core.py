@@ -28,6 +28,7 @@ class Limits:
     min_jump_m: float = 0.25          # jumps below this are always tolerated (tracker noise, dup frames)
     quat_norm_tol: float = 0.1        # |norm - 1| above this -> reject
     require_body: bool = True         # drop frames without the 24 body joints
+    frozen_body_frames: int = 50      # this many frames with a bit-identical body = tracking is frozen
     allow_synthetic: bool = True      # accept frames flagged as coming from the fake SDK
 
 
@@ -88,6 +89,8 @@ class BridgeCore:
         self._origin: Optional[Tuple[float, float, float]] = None
         self._yaw_q = (0.0, 0.0, 0.0, 1.0)       # rotation that turns the operator's heading to +x
         self._combo_was_down = False
+        self._last_body = None
+        self._same_body = 0
         self._frame_index = 0
         self._last_ts = 0
 
@@ -165,6 +168,16 @@ class BridgeCore:
             return self._reject("no_body")
         if self.robot_frame and not f.flags & wire.FLAG_HEAD:
             return self._reject("no_head")
+        # A living body never gives the very same 24 poses twice in a row for long (tracking
+        # noise alone prevents it).  Bit-identical frames mean the headset's body tracking has
+        # stopped updating: passing that on would send the robot to one stale pose.
+        if f.body is not None and self.limits.frozen_body_frames > 0:
+            if f.body == self._last_body:
+                self._same_body += 1
+            else:
+                self._last_body, self._same_body = f.body, 0
+            if self._same_body >= self.limits.frozen_body_frames:
+                return self._reject("body_frozen")
 
         # ---- content checks on everything that will be emitted --------------------------
         used = []

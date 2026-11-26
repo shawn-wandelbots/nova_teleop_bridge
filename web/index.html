@@ -318,6 +318,8 @@ function render(s) {
   $("s-out").textContent = link ? link.out_hz + " / s" + (live ? "" : " (not sent)") : "–";
   $("s-stream").textContent = !link ? "–" : link.state === "active" ? "Healthy" : (link.rx_hz > 0 ? "Rejected" : "Waiting");
   const why = { bad_quat: "The headset sends no real body tracking data. Switch on the motion trackers (both ankles and waist), calibrate them in the PICO, then start teleop in the headset again.",
+                body_frozen: "The headset's body tracking is frozen: it keeps sending one old pose. Leave teleop in the headset, close the Nova Teleop app completely, open it again and start teleop.",
+                no_heading: "The body tracking data makes no sense (shoulders and hips on one spot). Recalibrate the motion trackers.",
                 no_body: "The headset sends no body tracking data. Switch on and calibrate the motion trackers.",
                 no_head: "The headset position is missing from the stream.",
                 jump: "The tracked pose jumped. Hold still for a moment; it recovers by itself.",

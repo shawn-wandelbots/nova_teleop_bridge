@@ -32,7 +32,8 @@ class Harness:
         if cfg_edit:
             cfg_edit(cfg)
         self.logs = []
-        self.core = BridgeCore(cfg, limits or Limits(resume_frames=1), sender_ip=sender_ip,
+        # the synthetic test frames repeat one body pose: the frozen-body guard has its own tests
+        self.core = BridgeCore(cfg, limits or Limits(resume_frames=1, frozen_body_frames=0), sender_ip=sender_ip,
                                wall_clock_ns=lambda: 1_700_000_000_123_456_789, log=self.logs.append)
         self.now = 100.0
         self.seq = 0

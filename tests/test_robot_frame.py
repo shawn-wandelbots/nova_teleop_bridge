@@ -277,3 +277,24 @@ class TestBodyReference(unittest.TestCase):
         self.send(h, _body_at(0.0, 0.0, 0.0))
         self.walk(h, 0.2, 0.2, 170.0, steps=40)
         self.check_centred(self.send(h, _body_at(0.2, 0.2, 170.0), xyab=True))
+
+
+class TestFrozenBody(unittest.TestCase):
+    def test_identical_body_frames_are_rejected_until_the_body_moves(self):
+        from robot.bridge_core import Limits
+        h = Harness(limits=Limits(resume_frames=1, frozen_body_frames=20))
+        body = _body_at(0.0, 0.0, 0.0)
+
+        def hands_move(k):
+            def mut(f):
+                f.body = body
+                f.left_pose = (0.01 * k, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0)      # controllers do move
+            return mut
+        results = [h.send(mutate=hands_move(k)) for k in range(40)]
+        self.assertTrue(all(r is not None for r in results[:20]))
+        self.assertTrue(all(r is None for r in results[20:]))
+        self.assertEqual(h.core.last_reason, "body_frozen")
+
+        def alive(f):
+            f.body = _body_at(0.001, 0.0, 0.0)
+        self.assertIsNotNone(h.send(mutate=alive))

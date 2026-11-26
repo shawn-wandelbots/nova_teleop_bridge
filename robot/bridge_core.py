@@ -38,7 +38,6 @@ class Output:
     seq: int
     t_send_ns: int
     robot_frame: Optional[bytes] = None   # encoded aimdk.protocol.RobotFrameData (robot_frame mode)
-    hands: Tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)   # left trigger, left grip, right trigger, right grip
 
 
 def _clamp(v: float, lo: float, hi: float) -> float:
@@ -265,10 +264,6 @@ class BridgeCore:
                 p, q = tf(f.right_pose)
                 xr.right_hand.append(a3_proto.Joint(code=0, pos=p, quat=q))
         btn = a3_proto.VRButtons(timestamp=ts, controllers=controllers, external_device=self.external_device)
-        hands = [0.0, 0.0, 0.0, 0.0]
-        for c in controllers:
-            base = 0 if c.code == self.left_code else 2
-            hands[base], hands[base + 1] = c.index_trig, c.hand_trig
         rf = None
         if self.robot_frame:
             devices = []
@@ -291,7 +286,7 @@ class BridgeCore:
             self._frame_index += 1
         return Output(xr_frame=a3_proto.encode_xr_frame(xr, self.explicit),
                       vr_button=a3_proto.encode_vr_buttons(btn, self.explicit),
-                      seq=f.seq, t_send_ns=f.t_send_ns, robot_frame=rf, hands=tuple(hands))
+                      seq=f.seq, t_send_ns=f.t_send_ns, robot_frame=rf)
 
     def _timestamp(self, f: wire.Frame) -> int:
         m = self.timestamp_mode

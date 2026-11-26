@@ -195,6 +195,15 @@ ul.how b { color: var(--text); font-weight: 600; }
     </div>
   </section>
 
+  <section class="card" aria-labelledby="h-hands">
+    <h2 id="h-hands">Hands and fingers</h2>
+    <p style="color:var(--text-muted);margin:0 0 14px">The index trigger closes the hand. Which fingers close is chosen
+      with the controller buttons, separately for each hand. For "only two fingers, the rest open", step once to <b style="color:var(--text)">Pinch</b>.
+      The robot most likely starts in Grasp each time teleoperation mode is started.</p>
+    <img src="/gestures.svg" alt="Y plus left trigger or B plus right trigger switches to the next hand gesture: grasp, pinch, point, three-finger pinch. Tap Y or B to rotate the thumb, hold to swing it sideways."
+         style="display:block;width:100%;height:auto;border-radius:12px;border:1px solid var(--divider)">
+  </section>
+
   <section class="card" aria-labelledby="h-set">
     <h2 id="h-set">Settings</h2>
     <form id="f-settings" autocomplete="off">
@@ -204,22 +213,6 @@ ul.how b { color: var(--text); font-weight: 600; }
         <div><label for="i-port">Headset stream port</label>
           <input type="number" id="i-port" min="1024" max="65535"></div>
       </div>
-
-      <hr>
-      <h2 style="margin-bottom:6px">Fingers</h2>
-      <p style="color:var(--text-muted);margin:0 0 14px">What the index trigger does. The other fingers stay open.
-        Fingers only follow while that hand's grip is held; let go of the grip and they keep their position.</p>
-      <div class="form">
-        <div><label for="i-hand">Trigger closes</label>
-          <select id="i-hand">
-            <option value="robot">Robot's built-in finger control</option>
-            <option value="two">2 fingers: thumb + index</option>
-            <option value="three">3 fingers: thumb + index + middle</option>
-          </select></div>
-        <div><label for="i-close">How far they close (%)</label>
-          <input type="number" id="i-close" min="10" max="100" step="5"></div>
-      </div>
-      <div id="hand-note"></div>
 
       <hr>
       <h2 style="margin-bottom:6px">Data collection <span class="tag">Not built yet</span></h2>
@@ -329,15 +322,13 @@ function render(s) {
   $("bridge-log").textContent = (b.log && b.log.length) ? b.log.join("\n") : "–";
 
   if (!settingsLoaded) { fillSettings(s.settings); settingsLoaded = true; }
-  note($("hand-note"), s.hand_verified ? "" :
-    "The 2 and 3 finger options are not checked on this robot yet, so going live with them is refused. The robot's built-in finger control works as before.");
-  if (link && link.fingers) $("s-stream").textContent += link.hand_found ? " · fingers on" : " · waiting for hands";
+
 }
 
 function fillSettings(s) {
   const d = s.data_collection;
   $("i-sender").value = s.bridge.sender_ip; $("i-port").value = s.bridge.port;
-  $("i-hand").value = s.hand.mode; $("i-close").value = s.hand.close_percent;
+
   $("i-task").value = d.task; $("i-operator").value = d.operator; $("i-server").value = d.server_url;
   $("i-format").value = d.upload_format; $("i-spool").value = d.max_spool_gb;
   $("c-head").checked = d.cameras.head; $("c-keep").checked = d.keep_local_copy;
@@ -392,7 +383,6 @@ $("f-settings").onsubmit = async ev => {
   ev.preventDefault();
   const body = {
     bridge: { sender_ip: $("i-sender").value.trim(), port: Number($("i-port").value) },
-    hand: { mode: $("i-hand").value, close_percent: Number($("i-close").value) },
     data_collection: {
       task: $("i-task").value.trim(), operator: $("i-operator").value.trim(), server_url: $("i-server").value.trim(),
       upload_format: $("i-format").value, max_spool_gb: Number($("i-spool").value),

@@ -189,6 +189,57 @@ class TestService(unittest.TestCase):
         time.sleep(0.7)
         self.assertFalse(self.gate.page_open())
 
+    def write_stream_status(self, valid_hz):
+        with open(self.svc.status_file, "w") as fh:
+            json.dump({"t": time.time(), "valid_hz": valid_hz, "mode": "robot-input", "state": "active"}, fh)
+
+    def test_teleoperating_keeps_the_page_open_and_brings_it_back(self):
+        self.args.idle_close_s = 1.0
+        try:
+            end = time.time() + 2.5
+            while time.time() < end:                       # headset streams: nobody touches the page
+                self.write_stream_status(100.0)
+                self.say(session.HELLO)
+                time.sleep(0.2)
+            self.assertTrue(self.gate.page_open())
+            os.remove(self.svc.status_file)                # headset taken off: stream stops
+            end = time.time() + 4
+            while time.time() < end and self.gate.page_open():
+                self.say(session.HELLO)                    # the app is still alive and says hello
+                time.sleep(0.2)
+            self.assertFalse(self.gate.page_open())
+            self.write_stream_status(100.0)                # headset back on: streaming again
+            self.say(session.HELLO)
+            self.assertTrue(wait_for(self.gate.page_open))
+            self.base = "http://127.0.0.1:%d" % self.gate.web_port
+            self.assertEqual(self.status()["robot"]["state"], "Manual")   # the old browser still works
+        finally:
+            try:
+                os.remove(self.svc.status_file)
+            except OSError:
+                pass
+
+    def test_goodbye_leaves_teleoperation_mode(self):
+        self.assertEqual(self.post("/api/teleop/start")[0], 200)
+        self.assertTrue(wait_for(lambda: self.svc.cache["robot"].get("state") == "RemoteMotionStream"))
+        wait_for(lambda: self.svc.transition["done"])
+        self.say(session.BYE)
+        self.assertTrue(wait_for(lambda: FakeRobot.state == "Manual"))
+        self.assertFalse(self.gate.page_open())
+
+    def test_goodbye_can_leave_the_robot_alone(self):
+        self.assertEqual(self.post("/api/settings", {"session": {"leave_teleop_on_disconnect": False}})[0], 200)
+        try:
+            self.post("/api/teleop/start")
+            self.assertTrue(wait_for(lambda: self.svc.cache["robot"].get("state") == "RemoteMotionStream"))
+            wait_for(lambda: self.svc.transition["done"])
+            self.say(session.BYE)
+            self.assertTrue(wait_for(lambda: not self.gate.page_open()))
+            time.sleep(0.5)
+            self.assertEqual(FakeRobot.state, "RemoteMotionStream")
+        finally:
+            self.svc.save_settings({"session": {"leave_teleop_on_disconnect": True}})
+
     def test_garbage_datagrams_are_ignored(self):
         self.say(session.BYE)
         self.assertTrue(wait_for(lambda: not self.gate.page_open()))

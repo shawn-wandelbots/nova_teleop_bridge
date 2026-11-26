@@ -129,7 +129,8 @@ ul.how b { color: var(--text); font-weight: 600; }
     <h2>Closed</h2>
     <h3 style="margin:0 0 6px;font-size:18px">This page is closed</h3>
     <p style="color:var(--text-muted);margin:0">It opens when Nova Teleop on the headset connects to the robot. It closes when the headset
-      disconnects, or after 15 minutes without use. Connect again in the headset, then reload.</p>
+      disconnects, or after 15 minutes in which nobody uses the page or teleoperates. Put the headset back on
+      or connect again in the headset, then reload.</p>
   </section>
 </main>
 
@@ -212,6 +213,8 @@ ul.how b { color: var(--text); font-weight: 600; }
           <input type="text" id="i-sender" placeholder="e.g. 192.168.1.50" inputmode="decimal"></div>
         <div><label for="i-port">Headset stream port</label>
           <input type="number" id="i-port" min="1024" max="65535"></div>
+        <div><label>When the connection is closed in the headset</label>
+          <label class="check"><input type="checkbox" id="c-leave"> Leave teleoperation mode automatically</label></div>
       </div>
 
       <hr>
@@ -336,6 +339,7 @@ function render(s) {
 function fillSettings(s) {
   const d = s.data_collection;
   $("i-sender").value = s.bridge.sender_ip; $("i-port").value = s.bridge.port;
+  $("c-leave").checked = s.session.leave_teleop_on_disconnect;
 
   $("i-task").value = d.task; $("i-operator").value = d.operator; $("i-server").value = d.server_url;
   $("i-format").value = d.upload_format; $("i-spool").value = d.max_spool_gb;
@@ -391,6 +395,7 @@ $("f-settings").onsubmit = async ev => {
   ev.preventDefault();
   const body = {
     bridge: { sender_ip: $("i-sender").value.trim(), port: Number($("i-port").value) },
+    session: { leave_teleop_on_disconnect: $("c-leave").checked },
     data_collection: {
       task: $("i-task").value.trim(), operator: $("i-operator").value.trim(), server_url: $("i-server").value.trim(),
       upload_format: $("i-format").value, max_spool_gb: Number($("i-spool").value),

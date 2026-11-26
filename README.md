@@ -149,15 +149,17 @@ stateDiagram-v2
     Closed --> Locked: headset connects<br/>(shows a 4-letter word)
     Locked --> Open: word typed in the browser
     Open --> Closed: headset disconnects
-    Open --> Closed: 15 minutes without use
+    Open --> Closed: 15 minutes without use<br/>or teleoperation
     Locked --> Closed: headset disconnects
     Open --> Locked: headset reconnects<br/>(new word)
 ```
 
 - The word is picked by the headset, new for every connection.
 - Five wrong words in a row pause the lock for 30 seconds.
-- Closing the page does **not** change what the robot is doing. Reconnect in the headset to
-  get the page back.
+- Teleoperating counts as use: the page never idles out while the headset is streaming. If it
+  did close for idleness, it comes back with the same word when that headset streams again.
+- When the connection is closed in the headset, the live link stops and the robot leaves
+  teleoperation mode (this can be switched off in Settings).
 - While the service runs, the bridge stays in **test mode** so the headset can find the robot.
   *Go live* on the page switches it to live; *Back to test mode* switches it back.
 

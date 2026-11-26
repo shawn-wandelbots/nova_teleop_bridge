@@ -54,6 +54,8 @@ BOARDS = (("head", "Head board", "10.42.10.10"), ("main", "Main controller", "10
 
 DEFAULT_SETTINGS = {
     "bridge": {"sender_ip": "", "port": 39500},
+    # What the robot does when the operator closes the connection in the headset.
+    "session": {"leave_teleop_on_disconnect": True},
     "data_collection": {
         "enabled": False,
         "task": "",
@@ -151,6 +153,29 @@ class Service:
 
     def touch(self):
         self.last_interaction = time.time()
+
+    def stream_active(self):
+        """True while valid headset frames are arriving (the operator is teleoperating)."""
+        try:
+            with open(self.status_file) as fh:
+                snap = json.load(fh)
+            return time.time() - snap.get("t", 0) < 3.0 and snap.get("valid_hz", 0) > 0
+        except (OSError, ValueError):
+            return False
+
+    def headset_left(self):
+        """The operator closed the connection in the headset: stop feeding the robot and,
+        if set so, take the robot out of teleoperation mode."""
+        if self.bridge_running() and self.bridge_mode == "live":
+            self.stop_bridge()
+        with self.lock:
+            leave = self.settings["session"]["leave_teleop_on_disconnect"]
+            in_teleop = self.cache["robot"].get("state") == TELEOP_STATE
+        if leave and in_teleop:
+            try:
+                self.teleop("stop")
+            except RuntimeError as e:
+                log("could not leave teleoperation mode: %s" % e)
 
     def idle_seconds(self):
         return time.time() - self.last_interaction
@@ -473,8 +498,10 @@ class Gate:
     """Opens the web page when a headset says hello and closes it again.
 
     hello (new session)  -> page opens with that word; browsers unlocked before are locked out
-    goodbye              -> page closes
-    idle_close_s unused  -> page closes
+    goodbye              -> page closes; live link stops; robot leaves teleoperation mode (setting)
+    idle_close_s unused  -> page closes.  Teleoperating counts as use: while valid headset
+                            frames arrive the page never idles out.  A page closed for idleness
+                            comes back, with the same word, as soon as that headset streams again.
     While a headset keeps saying hello, hellos from other addresses are ignored.
     """
     HELLO_FRESH_S = 5.0
@@ -489,6 +516,8 @@ class Gate:
         self.web_port = None
         self.peer = None              # (ip, session id)
         self.ended = None             # the session whose page was closed: its late hellos do not reopen it
+        self.resumable = False        # ended by idleness (not by goodbye): may come back
+        self.ended_hello = 0.0
         self.last_hello = 0.0
         self._stop = False
 
@@ -504,8 +533,10 @@ class Gate:
         self.svc.open_page(word)
         log("page OPEN on port %d (%s)" % (self.web_port, why))
 
-    def _close(self, why):
-        self.svc.close_page()
+    def _close(self, why, resumable=False):
+        if not resumable:
+            self.svc.close_page()         # forget the word: a new connection is needed
+        self.resumable = resumable
         self.ended, self.peer = self.peer or self.ended, None
         if self.httpd is not None:
             h, self.httpd = self.httpd, None
@@ -526,15 +557,21 @@ class Gate:
                 self.last_hello = now
                 return
             if self.ended == (ip, sid):
-                return                              # closed for this connection: reconnect in the headset
+                self.ended_hello = now              # closed for this connection; see step() for the way back
+                return
             if self.peer and self.peer[0] != ip and now - self.last_hello < self.HELLO_FRESH_S:
                 return                              # another headset is connected right now
             self.peer, self.last_hello = (ip, sid), now
+            self.resumable = False
             self._open(word, "headset %s connected" % ip)
         elif kind == sess.BYE and self.peer == (ip, sid):
             self._close("headset closed the connection")
-        elif kind == sess.BYE and self.peer is None:
-            self.ended = (ip, sid)
+            self.svc.headset_left()
+        elif kind == sess.BYE and (self.peer is None or self.ended == (ip, sid)):
+            if self.resumable and self.ended == (ip, sid):
+                self.svc.close_page()
+                self.svc.headset_left()
+            self.ended, self.resumable = (ip, sid), False
 
     def step(self, timeout=0.5):
         try:
@@ -549,8 +586,21 @@ class Gate:
                 except (BlockingIOError, InterruptedError):
                     break
                 self._on_datagram(data, addr[0], now)
-        if self.httpd is not None and self.svc.idle_seconds() > self.a.idle_close_s:
-            self._close("not used for %d min" % (self.a.idle_close_s // 60))
+        active = self.svc.stream_active()
+        if self.httpd is not None:
+            if active:
+                self.svc.touch()                    # teleoperating counts as using the page
+            elif self.svc.idle_seconds() > self.a.idle_close_s:
+                self._close("not used for %d min" % (self.a.idle_close_s // 60), resumable=True)
+        elif self.resumable and active and self.ended and now - self.ended_hello < self.HELLO_FRESH_S:
+            # the same headset is streaming again: give the page back, same word, same browsers
+            self.peer, self.ended, self.resumable, self.last_hello = self.ended, None, False, now
+            self.httpd = ThreadingHTTPServer((self.a.listen_ip, self.a.port), Handler)
+            self.httpd.daemon_threads = True
+            self.web_port = self.httpd.server_address[1]
+            threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+            self.svc.touch()
+            log("page OPEN again on port %d (headset is streaming again)" % self.web_port)
 
     def run(self):
         while not self._stop:

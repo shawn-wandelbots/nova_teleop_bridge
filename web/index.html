@@ -313,12 +313,20 @@ function render(s) {
   $("s-sender").textContent = link && link.sender ? link.sender : "–";
   $("s-rx").textContent = link ? link.rx_hz + " / s" : "–";
   $("s-out").textContent = link ? link.out_hz + " / s" + (live ? "" : " (not sent)") : "–";
-  $("s-stream").textContent = !link ? "–" : link.state === "active" ? "Healthy" : (link.rx_hz > 0 ? "Rejected: " + (link.last_reject || "?") : "Waiting");
+  $("s-stream").textContent = !link ? "–" : link.state === "active" ? "Healthy" : (link.rx_hz > 0 ? "Rejected" : "Waiting");
+  const why = { bad_quat: "The headset sends no real body tracking data. Switch on the motion trackers (both ankles and waist), calibrate them in the PICO, then start teleop in the headset again.",
+                no_body: "The headset sends no body tracking data. Switch on and calibrate the motion trackers.",
+                no_head: "The headset position is missing from the stream.",
+                jump: "The tracked pose jumped. Hold still for a moment; it recovers by itself.",
+                bad_source: "Another device is sending to the robot. Only the first headset is accepted.",
+                nonfinite: "The headset sends invalid numbers. Restart teleop in the headset." };
+  const rejected = link && link.state !== "active" && link.rx_hz > 0;
+  const rejectNote = rejected ? (why[link.last_reject] || ("The stream is rejected: " + (link.last_reject || "unknown reason") + ".")) : "";
   let bn = "";
   if (live && !r.teleop) bn = "The headset link is live but the robot is not in teleoperation mode, so the robot ignores it. Do step 1.";
   else if (live && link && link.send_errors > 0 && !s.input.running) bn = "The robot's teleop input is not running, so frames are not arriving.";
   else if (b.running && !b.managed) bn = "A headset link started outside this page is running. Stop it where it was started.";
-  note($("bridge-note"), bn);
+  note($("bridge-note"), rejectNote || bn, rejectNote ? "err" : "");
   $("bridge-log").textContent = (b.log && b.log.length) ? b.log.join("\n") : "–";
 
   if (!settingsLoaded) { fillSettings(s.settings); settingsLoaded = true; }

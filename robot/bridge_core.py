@@ -37,6 +37,7 @@ class Output:
     vr_button: bytes      # encoded aimdk.protocol.VRButtonChannel
     seq: int
     t_send_ns: int
+    robot_frame: Optional[bytes] = None   # encoded aimdk.protocol.RobotFrameData (robot_frame mode)
 
 
 def _clamp(v: float, lo: float, hi: float) -> float:
@@ -47,7 +48,7 @@ class BridgeCore:
     """Feed datagrams with :meth:`handle`, call :meth:`tick` regularly for the watchdog."""
 
     def __init__(self, config: dict, limits: Optional[Limits] = None, sender_ip: Optional[str] = None,
-                 wall_clock_ns=time.time_ns, log=None):
+                 wall_clock_ns=time.time_ns, log=None, robot_frame: bool = False):
         self.limits = limits or Limits()
         self.transform = FrameTransform.from_config(config)
         c = config.get("controllers", {})
@@ -68,6 +69,19 @@ class BridgeCore:
         self.external_device = a3_proto.EXTERNAL_DEVICE_NAMES[ext]
         self.explicit = bool(o.get("explicit_defaults", True))
         self.pose_joints = bool(o.get("controller_pose_as_hand_joint", False))
+        # RobotFrameData output (what the robot's own teleop input port takes), see a3_proto.
+        self.robot_frame = bool(robot_frame)
+        self.quat_mode = o.get("robot_frame_quaternion", "compressed")
+        if self.quat_mode not in a3_proto.QUAT_MODES:
+            raise ValueError("robot_frame_quaternion must be one of %s" % (a3_proto.QUAT_MODES,))
+        # "first_head": positions are measured from where the head was when the stream started
+        # (the vendor headset app does this: head height is z = 0).  "fixed": use them as they come.
+        self.origin_mode = o.get("origin", "fixed")
+        if self.origin_mode not in ("fixed", "first_head"):
+            raise ValueError("origin must be 'fixed' or 'first_head'")
+        self._origin: Optional[Tuple[float, float, float]] = None
+        self._frame_index = 0
+        self._last_ts = 0
 
         self.sender_ip = sender_ip          # None -> lock onto the first sender of a fully valid datagram
         self.sender_locked_by_first_seen = False
@@ -141,16 +155,20 @@ class BridgeCore:
                 return self._reject("synthetic")
         if f.body is None and self.limits.require_body:
             return self._reject("no_body")
+        if self.robot_frame and not f.flags & wire.FLAG_HEAD:
+            return self._reject("no_head")
 
         # ---- content checks on everything that will be emitted --------------------------
         used = []
         if f.body is not None:
             used.extend(f.body)
-        if self.pose_joints:
+        if self.pose_joints or self.robot_frame:
             if f.flags & wire.FLAG_LEFT:
                 used.append(f.left_pose)
             if f.flags & wire.FLAG_RIGHT:
                 used.append(f.right_pose)
+        if self.robot_frame or (self.origin_mode == "first_head" and f.flags & wire.FLAG_HEAD):
+            used.append(f.head)
         ctrl_in = []
         if f.flags & wire.FLAG_LEFT:
             ctrl_in.append((self.left_code, f.left))
@@ -166,11 +184,25 @@ class BridgeCore:
             if abs(q_norm(pose[3:7]) - 1.0) > self.limits.quat_norm_tol:
                 return self._reject("bad_quat")
 
+        # ---- origin ---------------------------------------------------------------------
+        if self.origin_mode == "first_head":
+            if stale_stream or self._origin is None:
+                if not f.flags & wire.FLAG_HEAD:
+                    return self._reject("no_head")
+                self._origin = self.transform.pose(f.head)[0]
+            ox, oy, oz = self._origin
+        else:
+            ox = oy = oz = 0.0
+
+        def tf(pose):
+            p, q = self.transform.pose(pose)
+            return (p[0] - ox, p[1] - oy, p[2] - oz), q
+
         body_joints: List[a3_proto.Joint] = []
         positions: List[Tuple[float, float, float]] = []
         if f.body is not None:
             for code, pose in enumerate(f.body):
-                p, q = self.transform.pose(pose)
+                p, q = tf(pose)
                 positions.append(p)
                 body_joints.append(a3_proto.Joint(code=code, pos=p, quat=q))
         lim = self.limits.max_abs_position_m
@@ -226,15 +258,35 @@ class BridgeCore:
                               controllers=list(controllers) if self.include_in_xr else [])
         if self.pose_joints:
             if f.flags & wire.FLAG_LEFT:
-                p, q = self.transform.pose(f.left_pose)
+                p, q = tf(f.left_pose)
                 xr.left_hand.append(a3_proto.Joint(code=0, pos=p, quat=q))
             if f.flags & wire.FLAG_RIGHT:
-                p, q = self.transform.pose(f.right_pose)
+                p, q = tf(f.right_pose)
                 xr.right_hand.append(a3_proto.Joint(code=0, pos=p, quat=q))
         btn = a3_proto.VRButtons(timestamp=ts, controllers=controllers, external_device=self.external_device)
+        rf = None
+        if self.robot_frame:
+            devices = []
+            poses = {self.left_code: f.left_pose, self.right_code: f.right_pose}
+            for c in controllers:
+                p, q = tf(poses[c.code])
+                devices.append(a3_proto.DeviceInput(
+                    device_type=a3_proto.DEVICE_LEFT if c.code == self.left_code else a3_proto.DEVICE_RIGHT,
+                    axis_click=c.axis_click, axis_x=c.axis_x, axis_y=c.axis_y, index_trig=c.index_trig,
+                    hand_trig=c.hand_trig, key_one=c.key_one, key_two=c.key_two, pos=p, quat=q))
+            devices.sort(key=lambda d: d.device_type)
+            p, q = tf(f.head)
+            devices.append(a3_proto.DeviceInput(device_type=a3_proto.DEVICE_HEAD, pos=p, quat=q))
+            # The robot drops a datagram whose timestamp it has already seen: keep it rising.
+            ts_ms = max(self._wall_ns() // 1_000_000, self._last_ts + 1)
+            self._last_ts = ts_ms
+            rf = a3_proto.encode_robot_frame(a3_proto.RobotFrame(
+                timestamp=ts_ms, frame_index=self._frame_index, body=body_joints, devices=devices),
+                self.quat_mode)
+            self._frame_index += 1
         return Output(xr_frame=a3_proto.encode_xr_frame(xr, self.explicit),
                       vr_button=a3_proto.encode_vr_buttons(btn, self.explicit),
-                      seq=f.seq, t_send_ns=f.t_send_ns)
+                      seq=f.seq, t_send_ns=f.t_send_ns, robot_frame=rf)
 
     def _timestamp(self, f: wire.Frame) -> int:
         m = self.timestamp_mode

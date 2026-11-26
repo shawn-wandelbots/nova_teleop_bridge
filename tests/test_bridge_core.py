@@ -28,6 +28,7 @@ class Harness:
 
     def __init__(self, limits=None, sender_ip=None, cfg_edit=None):
         cfg = load_config(CONFIG)
+        cfg["output"]["origin"] = "fixed"
         if cfg_edit:
             cfg_edit(cfg)
         self.logs = []

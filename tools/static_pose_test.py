@@ -7,9 +7,11 @@ hand.  It is steered at run time through a small JSON control file, so each phas
 (idle -> buttons -> grips -> tiny hand offset -> back) can be stepped by hand while the
 robot's logs are watched.
 
-DEFAULT IS --dry-run.  --publish really publishes /remote/vr_data and /remote/vr_button.
---udp HOST:PORT instead sends each XRFrameData as one datagram (experimental: the format
-hal_remote expects on its UDP port is not confirmed).
+DEFAULT IS --dry-run.  Live modes:
+  --robot-input HOST:PORT  (recommended) send RobotFrameData datagrams to the robot's teleop
+                           input port, like the vendor headset app (127.0.0.1:25618 on the
+                           robot).  The still pose then comes from tests/data/genielink_sample.cap.
+  --publish                publish /remote/vr_data and /remote/vr_button on ROS 2 directly.
 
 Control file (re-read every 100 ms; missing keys keep their defaults):
     {"grip": 0.0,            both hand_trig values, 0..1
@@ -40,6 +42,11 @@ from robot.recording import read_capture  # noqa: E402
 RIGHT = {"shoulder": 17, "elbow": 19, "wrist": 21, "hand": 23}
 LEFT = {"shoulder": 16, "elbow": 18, "wrist": 20, "hand": 22}
 DEFAULT_CTL = {"grip": 0.0, "trig": 0.0, "hold": [], "offset": [0.0, 0.0, 0.0], "side": "right", "stop": False}
+
+
+class Out:
+    def __init__(self, xr_frame, vr_button):
+        self.xr_frame, self.vr_button = xr_frame, vr_button
 
 
 def log(msg):
@@ -82,8 +89,8 @@ def main(argv=None):
     g = ap.add_mutually_exclusive_group()
     g.add_argument("--dry-run", action="store_true", help="encode only, send nothing (DEFAULT)")
     g.add_argument("--publish", action="store_true", help="REALLY publish to the robot's ROS 2 topics")
-    g.add_argument("--udp", metavar="HOST:PORT", help="send XRFrameData datagrams instead (experimental)")
-    ap.add_argument("--sample", default=os.path.join(here, "tests", "data", "pico_sample_contiguous.cap"))
+    g.add_argument("--robot-input", metavar="HOST:PORT", help="REALLY send RobotFrameData to the robot's teleop input")
+    ap.add_argument("--sample", default=None, help="capture file holding the still pose")
     ap.add_argument("--frame", type=int, default=0, help="index of the sample frame used as the still pose")
     ap.add_argument("--ctl", required=True, help="path of the JSON control file")
     ap.add_argument("--rate", type=float, default=100.0)
@@ -98,7 +105,16 @@ def main(argv=None):
     if args.max_offset > 0.10:
         raise SystemExit("--max-offset above 0.10 m is refused by this test tool")
 
-    base = load_pose(args.sample, args.frame)
+    data = os.path.join(here, "tests", "data")
+    base_devices = None
+    if args.robot_input:
+        frames = read_capture(args.sample or os.path.join(data, "genielink_sample.cap"))
+        rf0 = a3_proto.decode_robot_frame(frames[args.frame][1])
+        base, base_devices = rf0.body, {d.device_type: d for d in rf0.devices}
+        if len(base) != a3_proto.BODY_JOINT_COUNT or sorted(base_devices) != [0, 1, 2]:
+            raise SystemExit("sample frame is not a full RobotFrameData frame")
+    else:
+        base = load_pose(args.sample or os.path.join(data, "pico_sample_contiguous.cap"), args.frame)
     ext = a3_proto.EXTERNAL_DEVICE_NAMES[args.external_device]
 
     pub = sock = dest = None
@@ -106,11 +122,11 @@ def main(argv=None):
         from robot.teleop_bridge import RosPublisher  # noqa: PLC0415
         pub = RosPublisher(allow_other_publishers=True)
         log("PUBLISHING to ROS topics")
-    elif args.udp:
-        host, port = args.udp.rsplit(":", 1)
+    elif args.robot_input:
+        host, port = args.robot_input.rsplit(":", 1)
         dest = (host, int(port))
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        log("SENDING XRFrameData datagrams to %s:%d" % dest)
+        log("SENDING RobotFrameData datagrams to %s:%d" % dest)
     else:
         log("dry run: nothing is sent")
 
@@ -126,6 +142,7 @@ def main(argv=None):
     nxt = t0
     last_ctl = last_log = 0.0
     sent = 0
+    last_ts = 0
     while not stop["flag"]:
         now = time.monotonic()
         if now - t0 > args.duration:
@@ -169,9 +186,23 @@ def main(argv=None):
         btn = a3_proto.encode_vr_buttons(a3_proto.VRButtons(timestamp=ts, controllers=controllers,
                                                            external_device=ext))
         if pub:
-            pub.publish(xr, btn)
+            pub.publish(Out(xr, btn))
         elif sock:
-            sock.sendto(xr, dest)
+            last_ts = max(int(wall * 1e3), last_ts + 1)      # the robot drops repeated timestamps
+            devices = []
+            for c in controllers:
+                d0 = base_devices[c.code]
+                moved = (c.code == 1) == (side is RIGHT)
+                devices.append(a3_proto.DeviceInput(
+                    device_type=c.code, axis_click=c.axis_click, index_trig=c.index_trig, hand_trig=c.hand_trig,
+                    key_one=c.key_one, key_two=c.key_two, quat=d0.quat,
+                    pos=tuple(d0.pos[i] + off[i] for i in range(3)) if moved else d0.pos))
+            devices.append(base_devices[2])
+            try:
+                sock.sendto(a3_proto.encode_robot_frame(a3_proto.RobotFrame(
+                    timestamp=last_ts, frame_index=sent, body=body, devices=devices)), dest)
+            except OSError:
+                pass                                          # robot input not running: keep trying
         sent += 1
         if now - last_log >= 5.0:
             log("sent %d | grip %.2f trig %.2f hold %s | offset %s m" % (

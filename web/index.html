@@ -1,0 +1,337 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Nova Teleop</title>
+<style>
+/* Colours are the Wandelbots NOVA "Zero Gravity" dark theme tokens (same set as the headset app). */
+:root {
+  --bg: #141623;            /* BackgroundPaperElevation1 */
+  --bg-deep: #020617;       /* BackgroundDefault */
+  --surface: #171927;       /* BackgroundPaperElevation2 */
+  --primary: #8E56FC;       /* PrimaryMain */
+  --primary-dark: #883AFF;  /* PrimaryDark */
+  --primary-light: #9D83F6; /* PrimaryLight */
+  --on-primary: #ffffffde;
+  --text: #ffffff;
+  --text-muted: #ffffffb2;
+  --text-disabled: #ffffff61;
+  --divider: #ffffff1f;
+  --input-border: #ffffff3b;
+  --tonal: #ffffff1a;
+  --error: #EF5350;
+  --success: #26A69A;
+  --warning: #FFAB40;
+  --info: #536DFE;
+  --radius: 12px;
+}
+* { box-sizing: border-box; }
+html { color-scheme: dark; }
+body {
+  margin: 0; background: var(--bg); color: var(--text);
+  font: 15px/1.5 Inter, "Inter Variable", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+header {
+  display: flex; align-items: center; gap: 12px; padding: 18px 16px;
+  border-bottom: 1px solid var(--divider); background: var(--bg-deep);
+}
+header .mark { width: 28px; height: 28px; border-radius: 8px; background: var(--primary); flex: none;
+  display: grid; place-items: center; font-weight: 700; color: var(--on-primary); }
+header h1 { font-size: 17px; font-weight: 600; margin: 0; letter-spacing: .01em; }
+header .sub { color: var(--text-muted); font-size: 13px; margin-left: auto; text-align: right; }
+main { max-width: 980px; margin: 0 auto; padding: 20px 16px 48px; display: grid; gap: 16px; }
+.card { background: var(--surface); border: 1px solid var(--divider); border-radius: var(--radius); padding: 20px; }
+.card h2 { font-size: 13px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase;
+  color: var(--text-muted); margin: 0 0 14px; }
+.step { display: flex; gap: 14px; align-items: flex-start; }
+.num { width: 28px; height: 28px; border-radius: 50%; border: 1px solid var(--input-border); flex: none;
+  display: grid; place-items: center; font-size: 13px; font-weight: 600; color: var(--text-muted); }
+.num.done { background: var(--success); border-color: var(--success); color: #fff; }
+.step .body { flex: 1; min-width: 0; }
+.step h3 { margin: 2px 0 2px; font-size: 16px; font-weight: 600; }
+.step p { margin: 0 0 12px; color: var(--text-muted); }
+.row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+button {
+  font: inherit; font-weight: 600; border: 0; border-radius: 10px; padding: 10px 18px; cursor: pointer;
+  background: var(--tonal); color: var(--text); min-height: 42px;
+}
+button.primary { background: var(--primary); color: var(--on-primary); }
+button.primary:hover:not(:disabled) { background: var(--primary-dark); }
+button.danger { background: transparent; color: var(--error); box-shadow: inset 0 0 0 1px var(--error); }
+button:hover:not(:disabled) { filter: brightness(1.15); }
+button:disabled { background: var(--divider); color: #ffffff47; cursor: not-allowed; box-shadow: none; }
+button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px solid var(--primary-light); outline-offset: 2px; }
+.pill { display: inline-flex; align-items: center; gap: 7px; padding: 4px 11px; border-radius: 999px;
+  background: var(--tonal); font-size: 13px; font-weight: 600; white-space: nowrap; }
+.pill::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--text-disabled); }
+.pill.ok::before { background: var(--success); }
+.pill.warn::before { background: var(--warning); }
+.pill.bad::before { background: var(--error); }
+.pill.live { background: #8E56FC33; }
+.pill.live::before { background: var(--primary-light); }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+.stat { background: var(--bg); border: 1px solid var(--divider); border-radius: 10px; padding: 12px 14px; }
+.stat .k { color: var(--text-muted); font-size: 12px; letter-spacing: .04em; text-transform: uppercase; }
+.stat .v { font-size: 18px; font-weight: 600; margin-top: 2px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.note { border-left: 3px solid var(--warning); background: #FFAB4014; padding: 10px 14px; border-radius: 0 8px 8px 0;
+  color: var(--text-muted); margin: 12px 0 0; }
+.note.err { border-color: var(--error); background: #EF535014; color: var(--text); }
+.note.info { border-color: var(--info); background: #536DFE14; }
+label { display: block; font-size: 13px; color: var(--text-muted); margin-bottom: 5px; }
+input[type=text], input[type=number], select {
+  width: 100%; font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--input-border);
+  border-radius: 10px; padding: 9px 12px; min-height: 42px;
+}
+.form { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; }
+.check { display: flex; align-items: center; gap: 9px; color: var(--text); font-size: 15px; margin: 0; min-height: 30px; }
+.check input { width: 18px; height: 18px; accent-color: var(--primary); }
+.check.off { color: var(--text-disabled); }
+.tag { font-size: 11px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--warning);
+  border: 1px solid var(--warning); border-radius: 6px; padding: 1px 7px; margin-left: 8px; vertical-align: middle; }
+pre { margin: 12px 0 0; background: var(--bg-deep); border: 1px solid var(--divider); border-radius: 10px; padding: 12px;
+  font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: var(--text-muted);
+  overflow-x: auto; max-height: 220px; }
+details summary { cursor: pointer; color: var(--text-muted); font-size: 13px; margin-top: 12px; }
+hr { border: 0; border-top: 1px solid var(--divider); margin: 18px 0; }
+ul.how { margin: 0; padding-left: 18px; color: var(--text-muted); }
+ul.how b { color: var(--text); font-weight: 600; }
+#toast { position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%); background: var(--bg-deep);
+  border: 1px solid var(--divider); border-radius: 10px; padding: 10px 16px; display: none; max-width: 90vw; }
+</style>
+</head>
+<body>
+<header>
+  <div class="mark" aria-hidden="true">N</div>
+  <h1>Nova Teleop</h1>
+  <div class="sub"><span id="conn">Connecting…</span></div>
+</header>
+
+<main>
+  <section class="card" aria-labelledby="h-robot">
+    <h2 id="h-robot">Robot</h2>
+    <div class="row" style="margin-bottom:14px">
+      <span class="pill" id="p-state">State: …</span>
+      <span id="boards" class="row"></span>
+    </div>
+    <div id="robot-note"></div>
+  </section>
+
+  <section class="card" aria-labelledby="h-steps">
+    <h2 id="h-steps">Start teleoperation</h2>
+
+    <div class="step">
+      <div class="num" id="n1">1</div>
+      <div class="body">
+        <h3>Put the robot in teleoperation mode</h3>
+        <p>The robot starts its own teleop programs. This takes about 25 seconds. The robot must be standing, hung up or otherwise safe.</p>
+        <div class="row">
+          <button class="primary" id="b-teleop-start">Start teleoperation mode</button>
+          <button class="danger" id="b-teleop-stop">Leave teleoperation mode</button>
+          <span class="pill" id="p-input">Robot teleop input: …</span>
+        </div>
+        <div id="teleop-note"></div>
+      </div>
+    </div>
+    <hr>
+    <div class="step">
+      <div class="num" id="n2">2</div>
+      <div class="body">
+        <h3>Connect the headset</h3>
+        <p>Open Nova Teleop on the PICO headset and pick this robot. <b>Test</b> only checks the stream. <b>Live</b> passes it to the robot.</p>
+        <div class="row">
+          <button id="b-bridge-test">Start in test mode</button>
+          <button class="primary" id="b-bridge-live">Start live</button>
+          <button class="danger" id="b-bridge-stop">Stop headset link</button>
+          <span class="pill" id="p-bridge">Headset link: …</span>
+        </div>
+        <div class="grid" style="margin-top:14px">
+          <div class="stat"><div class="k">Headset</div><div class="v" id="s-sender">–</div></div>
+          <div class="stat"><div class="k">Frames received</div><div class="v" id="s-rx">–</div></div>
+          <div class="stat"><div class="k">Passed on</div><div class="v" id="s-out">–</div></div>
+          <div class="stat"><div class="k">Stream</div><div class="v" id="s-stream">–</div></div>
+        </div>
+        <div id="bridge-note"></div>
+        <details><summary>Headset link log</summary><pre id="bridge-log">–</pre></details>
+      </div>
+    </div>
+    <hr>
+    <div class="step">
+      <div class="num">3</div>
+      <div class="body">
+        <h3>Take control with the controllers</h3>
+        <ul class="how">
+          <li><b>X + Y + A + B together, then release</b> — calibrate (stand in the robot's pose first).</li>
+          <li><b>Hold both grips</b> — the robot follows your arms. Let go and it pauses.</li>
+          <li><b>Click both thumbsticks</b> — emergency stop.</li>
+          <li>If the headset stream stops for 2 seconds the robot pauses by itself and asks for a new calibration.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <section class="card" aria-labelledby="h-set">
+    <h2 id="h-set">Settings</h2>
+    <form id="f-settings" autocomplete="off">
+      <div class="form">
+        <div><label for="i-sender">Only accept this headset (IP address, empty = first one that connects)</label>
+          <input type="text" id="i-sender" placeholder="e.g. 192.168.1.50" inputmode="decimal"></div>
+        <div><label for="i-port">Headset stream port</label>
+          <input type="number" id="i-port" min="1024" max="65535"></div>
+      </div>
+
+      <hr>
+      <h2 style="margin-bottom:6px">Data collection <span class="tag">Not built yet</span></h2>
+      <p style="color:var(--text-muted);margin:0 0 14px">These settings are saved for later. Nothing is recorded or uploaded today.
+        The plan: the robot keeps each episode only until it is uploaded, then sends it to your server.</p>
+      <div class="form">
+        <div><label for="i-task">Task name</label><input type="text" id="i-task" placeholder="e.g. pick up the cup"></div>
+        <div><label for="i-operator">Operator</label><input type="text" id="i-operator"></div>
+        <div><label for="i-server">Upload server address</label><input type="text" id="i-server" placeholder="https://…"></div>
+        <div><label for="i-format">Upload format</label>
+          <select id="i-format">
+            <option value="lerobot">LeRobot dataset (converted on the robot)</option>
+            <option value="raw">Raw recording (convert to LeRobot on the server)</option>
+          </select></div>
+        <div><label for="i-spool">Temporary storage limit (GB)</label><input type="number" id="i-spool" min="1" max="2000"></div>
+        <div>
+          <label>Cameras</label>
+          <label class="check"><input type="checkbox" id="c-head"> Head camera</label>
+          <label class="check off"><input type="checkbox" id="c-wl" disabled> Left wrist camera (not installed)</label>
+          <label class="check off"><input type="checkbox" id="c-wr" disabled> Right wrist camera (not installed)</label>
+        </div>
+        <div><label>&nbsp;</label>
+          <label class="check"><input type="checkbox" id="c-keep"> Keep a copy on the robot after upload</label></div>
+      </div>
+      <div class="row" style="margin-top:16px">
+        <button class="primary" type="submit">Save settings</button>
+        <span id="save-msg" style="color:var(--text-muted)"></span>
+      </div>
+    </form>
+  </section>
+</main>
+<div id="toast" role="status"></div>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+let last = null, settingsLoaded = false, failures = 0;
+
+function pill(el, text, cls) { el.textContent = text; el.className = "pill" + (cls ? " " + cls : ""); }
+function note(el, text, cls) {
+  el.innerHTML = "";
+  if (!text) return;
+  const d = document.createElement("div");
+  d.className = "note" + (cls ? " " + cls : "");
+  d.textContent = text;
+  el.appendChild(d);
+}
+function toast(msg) {
+  const t = $("toast"); t.textContent = msg; t.style.display = "block";
+  clearTimeout(toast.h); toast.h = setTimeout(() => t.style.display = "none", 5000);
+}
+async function post(path, body) {
+  try {
+    const r = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json", "X-Nova-Teleop": "1" },
+                                  body: JSON.stringify(body || {}) });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { toast(j.error || ("Request failed (" + r.status + ")")); return null; }
+    return j;
+  } catch (e) { toast("The robot did not answer."); return null; }
+  finally { refresh(); }
+}
+
+function render(s) {
+  last = s;
+  const r = s.robot, tr = s.transition, busy = tr && !tr.done, b = s.bridge, link = b.link || null;
+  $("conn").textContent = "Updated " + new Date(s.time * 1000).toLocaleTimeString();
+
+  if (!r.reachable) pill($("p-state"), "State: no answer from the robot", "bad");
+  else pill($("p-state"), "State: " + (r.teleop ? "Teleoperation" : r.state) + (r.status ? " · " + r.status.replace("IN_", "").toLowerCase() : ""),
+            r.teleop ? "live" : "ok");
+  const boards = $("boards"); boards.innerHTML = "";
+  let down = [];
+  for (const bd of s.boards) {
+    const sp = document.createElement("span");
+    pill(sp, bd.name, bd.up ? "ok" : "bad"); boards.appendChild(sp);
+    if (!bd.up) down.push(bd.name.toLowerCase());
+  }
+  note($("robot-note"), down.length ? "Not reachable: " + down.join(", ") + ". The robot refuses teleoperation mode until all boards are up. Restart the robot if this stays." : "", "err");
+
+  // step 1
+  $("n1").className = "num" + (r.teleop ? " done" : "");
+  $("b-teleop-start").disabled = busy || r.teleop || !r.reachable || down.length > 0;
+  $("b-teleop-stop").disabled = busy || !r.teleop;
+  pill($("p-input"), "Robot teleop input: " + (s.input.running ? "running" : "off"), s.input.running ? "ok" : "");
+  if (busy) note($("teleop-note"), (tr.action === "start" ? "Switching to teleoperation mode… " : "Leaving teleoperation mode… ")
+                 + Math.round(s.time - tr.since) + " s", "info");
+  else if (tr && tr.error) note($("teleop-note"), "The robot said no: " + tr.error, "err");
+  else note($("teleop-note"), "");
+
+  // step 2
+  const live = b.running && b.mode === "live";
+  $("n2").className = "num" + (live && link && link.state === "active" ? " done" : "");
+  $("b-bridge-test").disabled = b.running;
+  $("b-bridge-live").disabled = b.running;
+  $("b-bridge-stop").disabled = !b.running || !b.managed;
+  pill($("p-bridge"), "Headset link: " + (!b.running ? "off" : live ? "LIVE" : "test mode"), !b.running ? "" : live ? "live" : "warn");
+  $("s-sender").textContent = link && link.sender ? link.sender : "–";
+  $("s-rx").textContent = link ? link.rx_hz + " / s" : "–";
+  $("s-out").textContent = link ? link.out_hz + " / s" + (live ? "" : " (not sent)") : "–";
+  $("s-stream").textContent = !link ? "–" : link.state === "active" ? "Healthy" : (link.rx_hz > 0 ? "Rejected: " + (link.last_reject || "?") : "Waiting");
+  let bn = "";
+  if (live && !r.teleop) bn = "The headset link is live but the robot is not in teleoperation mode, so the robot ignores it. Do step 1.";
+  else if (live && link && link.send_errors > 0 && !s.input.running) bn = "The robot's teleop input is not running, so frames are not arriving.";
+  else if (b.running && !b.managed) bn = "A headset link started outside this page is running. Stop it where it was started.";
+  note($("bridge-note"), bn);
+  $("bridge-log").textContent = (b.log && b.log.length) ? b.log.join("\n") : "–";
+
+  if (!settingsLoaded) { fillSettings(s.settings); settingsLoaded = true; }
+}
+
+function fillSettings(s) {
+  const d = s.data_collection;
+  $("i-sender").value = s.bridge.sender_ip; $("i-port").value = s.bridge.port;
+  $("i-task").value = d.task; $("i-operator").value = d.operator; $("i-server").value = d.server_url;
+  $("i-format").value = d.upload_format; $("i-spool").value = d.max_spool_gb;
+  $("c-head").checked = d.cameras.head; $("c-keep").checked = d.keep_local_copy;
+}
+
+async function refresh() {
+  try {
+    const r = await fetch("/api/status", { cache: "no-store" });
+    render(await r.json()); failures = 0;
+  } catch (e) {
+    if (++failures > 1) $("conn").textContent = "No connection to the robot";
+  }
+}
+
+$("b-teleop-start").onclick = () => {
+  if (confirm("Switch the robot to teleoperation mode?\n\nMake sure it is standing or hung up safely and nobody is within reach of its arms."))
+    post("/api/teleop/start");
+};
+$("b-teleop-stop").onclick = () => { if (confirm("Leave teleoperation mode? The headset link is stopped first.")) post("/api/teleop/stop"); };
+$("b-bridge-test").onclick = () => post("/api/bridge/start", { mode: "test" });
+$("b-bridge-live").onclick = () => {
+  if (confirm("Start the headset link LIVE?\n\nThe robot will follow the operator once they calibrate and hold both grips. Keep the emergency stop within reach."))
+    post("/api/bridge/start", { mode: "live" });
+};
+$("b-bridge-stop").onclick = () => post("/api/bridge/stop");
+$("f-settings").onsubmit = async ev => {
+  ev.preventDefault();
+  const body = {
+    bridge: { sender_ip: $("i-sender").value.trim(), port: Number($("i-port").value) },
+    data_collection: {
+      task: $("i-task").value.trim(), operator: $("i-operator").value.trim(), server_url: $("i-server").value.trim(),
+      upload_format: $("i-format").value, max_spool_gb: Number($("i-spool").value),
+      keep_local_copy: $("c-keep").checked, cameras: { head: $("c-head").checked }
+    }
+  };
+  const j = await post("/api/settings", body);
+  if (j) { fillSettings(j.settings); $("save-msg").textContent = "Saved. Headset settings apply the next time the link is started."; }
+};
+refresh(); setInterval(refresh, 1500);
+</script>
+</body>
+</html>

@@ -1,272 +1,233 @@
 # nova_teleop_bridge
 
-Teleoperate an **AgiBot A3** humanoid from a **PICO 4** headset running the open-source
-**XRoboToolkit** app, without the vendor's PICO app.
+Move an **AgiBot A3** humanoid robot with your own body, using a **PICO 4** headset and its
+two controllers.
 
-> **Status: untested on hardware.** Everything in this repository has only been run offline
-> (unit tests and loopback UDP). The robot-side publisher has never been executed. Read
-> "Verified vs. unverified" and the power-on checklist before going anywhere near `--publish`.
+This repository is the part that runs **on the robot**. The headset app (Nova Teleop) lives
+in its own repository.
 
-## Architecture
+> **Status, honestly.** The software passes its tests and the packet format matches recorded
+> traffic of the vendor's headset app byte for byte. It has **not yet moved the real robot**.
+> See [What is proven and what is not](#what-is-proven-and-what-is-not).
 
-```
- PICO 4 headset                    Ubuntu PC                               A3 head board (Debian 12, ROS 2 Jazzy)
-+----------------+   Wi-Fi   +---------------------------+   UDP :39500   +--------------------------------------+
-| XRoboToolkit   | --------> | XRoboToolkit PC Service   |   "NTB1"       | robot/teleop_bridge.py               |
-| client app     |           |   xrobotoolkit_sdk (py)   |   100 Hz       |  validate -> transform -> protobuf   |
-+----------------+           | pc/xrt_adapter.py         | ------------>  |  watchdog, sender lock, limits       |
-                             | pc/xrt_sender.py          |  raw SDK data  |          |  (only with --publish)     |
-                             +---------------------------+                |          v                            |
-                                                                          | /remote/vr_data   (XRFrameData)      |
-                                                                          | /remote/vr_button (VRButtonChannel)  |
-                                                                          +----------|---------------------------+
-                                                                                     v  ROS 2 domain 232, BEST_EFFORT
-                                                                      teleop_avatar (body retargeting, buttons)
-                                                                      hal_remote trigger modules (grip dead-man, sticks)
-```
+---
 
-* The PC sends **raw SDK values** (XRoboToolkit frame) in a small versioned datagram
-  ([docs/WIRE_FORMAT.md](docs/WIRE_FORMAT.md)).
-* The robot applies the coordinate transform from **`config/transform.json`** (the one file that
-  holds every XRoboToolkit assumption: SDK function names, axis matrix, yaw, scale, offsets,
-  controller codes, output options) and produces the robot's own protobuf messages with a
-  hand-rolled encoder (the robot's Python has no `protobuf` package).
-* The messages are wrapped in `ros2_plugin_proto/msg/RosMsgWrapper` (`serialization_type = "pb"`)
-  and published on
-  `/remote/vr_data/pb_3Aaimdk_2Eprotocol_2EXRFrameData` and
-  `/remote/vr_button/pb_3Aaimdk_2Eprotocol_2EVRButtonChannel`.
+## The idea in one picture
 
-```
-config/transform.json        all XRoboToolkit-dependent settings (PROVISIONAL)
-teleop_common/wire.py        NTB1 datagram pack/unpack            (PC + robot)
-teleop_common/transform.py   quaternion maths, config-driven frame transform
-pc/xrt_adapter.py            the only code that calls xrobotoolkit_sdk
-pc/xrt_sender.py             PC main program
-pc/fake_xrt.py               fake SDK (synthetic figure, or replay of recorded A3 frames)
-robot/a3_proto.py            protobuf codec for XRFrameData / VRButtonChannel
-robot/bridge_core.py         validation, safety logic, conversion (no I/O)
-robot/teleop_bridge.py       robot main program (UDP in, dry-run / ROS out)
-robot/discovery.py           NTD1 discovery responder (lets the headset app find the bridge)
-robot/recording.py           record / capture file formats
-tools/capture_udp.py         capture raw datagrams on loopback (used with pico_mock_player)
-tools/analyze_frames.py      prints the numbers in docs/A3_FRAME_ANALYSIS.md
-tests/                       unit + loopback tests, two small excerpts of the robot's PICO sample
-docs/                        A3_FRAME_ANALYSIS.md, WIRE_FORMAT.md, DISCOVERY.md
+```mermaid
+flowchart LR
+    subgraph Operator
+        H["PICO headset<br/>Nova Teleop app"]
+    end
+    subgraph Robot["Robot (head computer)"]
+        B["Teleop bridge<br/><i>checks every frame</i>"]
+        I["Robot teleop input<br/><i>vendor software</i>"]
+        C["Robot controller<br/><i>vendor software</i>"]
+        W["Control page<br/><i>web UI</i>"]
+    end
+    L["Laptop or phone<br/>browser"]
+
+    H -- "body + controllers<br/>100 times a second, Wi-Fi" --> B
+    B -- "same packets the vendor<br/>headset app sends" --> I
+    I --> C --> A(("Arms<br/>and hands"))
+    L -- "buttons" --> W
+    W -- "start / stop" --> B
+    W -- "teleoperation mode on / off" --> C
 ```
 
-Dependencies: Python standard library only (3.8+ on the PC, 3.11 on the robot). The PC
-additionally needs `xrobotoolkit_sdk`; the robot needs `rclpy` + `ros2_plugin_proto` **only**
-when `--publish` is given (they are imported lazily, tests never load them).
+In plain words:
 
-## Running
+1. The **headset** measures where your head, hands and body are, and reads the controller
+   buttons. It sends this to the robot 100 times a second.
+2. The **bridge** on the robot checks each message. Broken, late or impossible messages are
+   thrown away. Good ones are rewritten into the exact packet the robot already understands.
+3. The **robot's own teleop software** does the rest: it decides when you are in control,
+   calibrates to your body and moves the arms. We do not replace it.
+4. The **control page** is a small website on the robot. You use it to switch the robot into
+   teleoperation mode and to start the bridge.
 
-### Tests (anywhere, offline)
+## How a session goes
 
-```
-python3 -m unittest            # from the repository root
-```
+```mermaid
+sequenceDiagram
+    actor Op as Operator
+    participant Page as Control page
+    participant Robot as Robot
+    participant Head as Headset
 
-Uses loopback UDP on private ports ≥ 39200 only (never the default ports 39500/39501, the
-discovery tests use ≥ 39600); publishes nothing; does not need ROS.
-
-### Robot side – dry run (the default)
-
-```
-python3 robot/teleop_bridge.py --port 39500 --sender-ip <PC ip> --record /tmp/teleop.rec
-```
-
-`--dry-run` is the default: datagrams are received, validated, transformed and encoded, rate
-statistics are printed every 5 s, `--record` stores every encoded output frame, and **nothing is
-published – ROS is not even imported**. Stop with Ctrl-C / SIGTERM.
-
-Inspect a record:
-
-```
-python3 - <<'PY'
-from robot.recording import read_record
-from robot.a3_proto import decode_xr_frame, decode_vr_buttons, BODY_JOINT_NAMES
-recs = read_record("/tmp/teleop.rec")
-f = decode_xr_frame(next(r[2] for r in recs if r[0] == 1))
-for j in f.body: print(BODY_JOINT_NAMES[j.code], j.pos, j.quat)
-print(decode_vr_buttons(next(r[2] for r in recs if r[0] == 2)))
-PY
+    Op->>Page: 1. Start teleoperation mode
+    Page->>Robot: switch state (takes about 25 s)
+    Robot-->>Page: teleoperation mode is on
+    Op->>Page: 2. Start headset link (live)
+    Head->>Robot: stream of body + controller data
+    Op->>Head: 3. Press X + Y + A + B, release
+    Robot-->>Op: calibrated
+    Op->>Head: 4. Hold both grips
+    Robot-->>Op: arms follow the operator
+    Op->>Head: Release grips
+    Robot-->>Op: arms pause
 ```
 
-### Discovery (finding the robot from the headset)
+| You do | The robot does |
+|---|---|
+| Press **X + Y + A + B** together, then release | Calibrates to your pose |
+| **Hold both grips** | Follows your arms. Let go and it pauses |
+| **Click both thumbsticks** | Emergency stop |
+| Nothing arrives for 2 seconds | Pauses by itself and wants a new calibration |
 
-The robot's Wi-Fi address changes with DHCP, so the headset app (Nova Teleop setup screen,
-"Find robots") searches for it instead of relying on a typed-in address:
+These button rules belong to the robot's own software, not to this project.
 
-* The bridge answers **NTD1 discovery probes** on UDP **39501** (`--discovery-port N`;
-  `--no-discovery` to switch it off) in both dry-run and publishing mode. The reply carries the
-  robot model, the last 4 characters of the robot's name, the NTB1 data port, the mode
-  (`dry-run` / `publish`) and whether a sender is locked in. Protocol and rules:
-  [docs/DISCOVERY.md](docs/DISCOVERY.md).
-* Independently of the bridge, the app sends an LLMNR query for the head computer's default
-  hostname `hdu`, which the robot's operating system answers. That finds the robot even when the
-  bridge is not running.
+## Quick start
 
-The responder is read-only: it answers only well-formed probes, one small reply (< 512 bytes)
-per probe, rate-limited per source, and a probe can never claim the sender lock or change any
-other bridge state. If port 39501 is taken the bridge logs it and runs without discovery.
+Everything needs only Python 3 from the standard install. Nothing to `pip install`.
 
-Limits: broadcast and multicast do not cross routers and are blocked by Wi-Fi client isolation
-(guest networks); LLMNR may be disabled; every AgiBot head computer answers to `hdu`, so several
-robots give several entries (tell them apart by `model` / `robot_id`); replies are not
-authenticated. A manually entered address always works.
+**1. Run the tests** (any computer, no robot needed):
 
-The app sends from the **headset's** address: `--sender-ip` must be that address (shown on the
-app's setup screen), or be left out to lock onto the first valid sender.
-
-### Robot side – live publishing
-
-**Has never been run. Do not run it before completing the checklist below.**
-
-```
-source <robot ROS 2 env: /opt/ros/jazzy, aimrt_protocol_ros2_package on PYTHONPATH/LD_LIBRARY_PATH,
-        ROS_DOMAIN_ID=232, the robot's FASTRTPS_DEFAULT_PROFILES_FILE>
-python3 robot/teleop_bridge.py --port 39500 --sender-ip <PC ip> --publish
+```bash
+python3 -m unittest discover -s tests
 ```
 
-With `--publish` the bridge refuses to start if another node already publishes either topic
-(override: `--allow-other-publishers`) and refuses frames from the fake SDK (override:
-`--allow-synthetic`, never on a live robot).
+**2. Start the control page on the robot:**
 
-### PC side
-
-```
-python3 pc/xrt_sender.py --robot-ip <robot ip> --port 39500             # real headset
-python3 pc/xrt_sender.py --robot-ip <robot ip> --port 39500 --fake      # synthetic figure, no headset
-python3 pc/xrt_sender.py --robot-ip 127.0.0.1 --fake --fake-replay tests/data/pico_sample_contiguous.cap
+```bash
+python3 robot/teleop_service.py
 ```
 
-The fake SDK is deliberately harmless (grips ≤ 0.3, stick clicks never pressed) and marks its
-datagrams as synthetic.
+Then open `http://<robot address>:8090/` in a browser and follow the three steps on the page.
 
-## Safety behaviour
+**3. Or run the bridge by hand:**
 
-Robot bridge:
+```bash
+python3 robot/teleop_bridge.py
+```
 
-* **Dry-run by default**; publishing needs the explicit `--publish`.
-* **One sender**: `--sender-ip`, or the first address that sends a fully valid datagram.
-* **Strict datagram checks**: magic, version, exact length, flag bits, CRC-32; duplicate and
-  out-of-order sequence numbers are dropped; a second sender session is ignored.
-* **Content checks**: NaN/inf, non-unit quaternions, coordinates beyond `--max-abs-position`
-  (10 m) and implausible jumps (more than `--min-jump` 0.25 m *and* faster than `--max-speed`
-  15 m/s since the last accepted frame) are dropped. A persisting jump is only accepted after
-  `--resync-ms` (600 ms) of silence, by which time the robot has ended the session on its own.
-* **Clamping**: trigger and grip to 0..1, stick axes to −1..1. Buttons are passed through
-  exactly as received – never synthesised, never suppressed (this includes the both-sticks
-  emergency-stop chord). An untracked controller is omitted, not reported as "released".
-* **Watchdog**: no valid frame for `--watchdog-ms` (100 ms) → output stops. After a stop,
-  `--resume-frames` (3) consecutive valid frames are needed before output resumes. Stale data is
-  never repeated; a backlog of queued datagrams is collapsed to the newest one.
-* **On stop/exit nothing more is published** – no zero or "release" frames. The robot's configs
-  define silence as the lost-input signal (500 ms controller timeout in `hal_remote`'s
-  `session_gate`, 150/200 ms slowdown and 1000 ms hard timeout in teleop_avatar; see
-  [docs/A3_FRAME_ANALYSIS.md](docs/A3_FRAME_ANALYSIS.md) §5).
-* Never binds or sends to the robot's own teleop ports (25618, 25619, 15000, 51000), never calls
-  a robot service. The discovery responder also refuses to reply to those ports and to ports
-  below 1024, and nothing it receives reaches the bridge core.
+That is **test mode**: it listens to the headset and checks the stream, but sends nothing to
+the robot. Add `--robot-input` to go live.
 
-PC sender: sends only what the SDK returned; skips a tick on any SDK error or NaN; goes silent
-when the SDK timestamp stops advancing for `--stale-ms` (100 ms); sends nothing on exit.
+## Safety
 
-**None of this replaces the hardware emergency stop.**
+The bridge is built so that **doing nothing is always the fallback**.
 
-## Verified vs. unverified
+```mermaid
+flowchart TD
+    A[Packet from headset] --> B{Right sender,<br/>intact, in order?}
+    B -- no --> X[Dropped]
+    B -- yes --> C{Numbers sane?<br/>no jumps, no nonsense}
+    C -- no --> X
+    C -- yes --> D{Stream healthy?}
+    D -- "no frames for 0.1 s" --> S["Bridge goes silent"]
+    D -- yes --> E[Sent to robot input]
+    S --> R["After 2 s of silence the robot<br/>pauses and resets calibration"]
+```
 
-VERIFIED (offline, on the robot's head board)
+- **Test mode is the default.** Going live needs an explicit switch (`--robot-input`) or the
+  *Start live* button, which asks first.
+- **One headset only.** The first valid sender is locked in; others are ignored.
+- **Bad data is dropped**, never repaired: damaged packets, repeats, out-of-order packets,
+  impossible positions, sudden jumps.
+- **Silence means stop.** When the stream stops, the bridge sends nothing. It never repeats
+  old data and never invents a "release" message. The robot notices the silence and pauses.
+- **Buttons are never made up.** Triggers and grips are only limited to their valid range.
+- **The control page has no login.** Use it only on a network you trust.
+- Keep the **emergency stop** in reach, and keep people out of reach of the arms.
 
-* Protobuf codec: decode → re-encode is byte-identical for all 2921 frames of the robot's own
-  PICO sample (replayed with `pico_mock_player` to a loopback port).
-* Target frame of that sample: right-handed, Z-up, metres, origin near head height (floor at
-  z ≈ −1.5), global joint quaternions `x,y,z,w`, joint-local +x forward / +y left / +z up,
-  arbitrary heading. Details and numbers: [docs/A3_FRAME_ANALYSIS.md](docs/A3_FRAME_ANALYSIS.md).
-* Topic name/type/QoS of `/remote/vr_data/pb_3Aaimdk_2Eprotocol_2EXRFrameData`
-  (`ros2_plugin_proto/msg/RosMsgWrapper`, BEST_EFFORT, VOLATILE) as seen with
-  `ros2 topic list -t` / `ros2 topic info -v` (one subscriber, the bag recorder; no publisher).
-* teleop_avatar's default input link is `pico-ros2` on `/remote/vr_data`.
-* Maths, wire format, watchdog, sequence handling and the loopback pipeline (unit tests).
+## The control page
 
-STATED BY ROBOT CONFIGS, NOT OBSERVED ON THE WIRE
+`robot/teleop_service.py` serves one page (`web/index.html`):
 
-* `controller_code_name`: 0 = left, 1 = right; `key_one` = X/A, `key_two` = Y/B
-  (hal_remote trigger configs). Configurable in `config/transform.json` → `controllers`.
-* Stick semantics: forward = +left y, lateral = −left x, turn = −right x, height = +right y.
+- **Robot** – current state and whether the robot's three computers answer.
+- **Start teleoperation** – the three steps above, with live numbers for the headset stream.
+- **Settings** – which headset to accept, and settings for data collection.
 
-UNVERIFIED – treat as wrong until proven on hardware
+**Data collection is not built yet.** The settings are saved so the page is ready, but nothing
+is recorded or uploaded today. The plan:
 
-* **The whole XRoboToolkit side**: SDK function names and return shapes, axis convention and
-  handedness, the joint-local frame of body joints, body joint order, stick axis signs, what
-  `get_time_stamp_ns()` does when the headset stalls. The default `transform` is PROVISIONAL.
-* **Whether `/remote/vr_data` uses the same frame as the sample.** The sample is the UDP
-  (pico-direct) format; `hal_remote` also publishes `/remote/vr_data/raw`, so it may process
-  frames before publishing `/remote/vr_data`.
-* **`/remote/vr_button` was not visible** in the ROS graph when this was written (`hal_remote`
-  was not running), so its exact topic name/type string and QoS are inferred from the naming
-  rule and the configs, not observed.
-* **Parallel publisher conflict**: `hal_remote` is the robot's normal publisher of both topics
-  (fed by UDP 25618/15000). If it is running and a PICO/app talks to it, two sources would
-  interleave. The bridge checks the publisher count at start-up and refuses, but that check is
-  itself untested, and an idle `hal_remote` may still register publishers.
-* **Bypassing `hal_remote` may disable button events.** `hal_remote` also derives
-  `/remote/button_edge` and `/event_trigger/button_event` (combos such as X+Y+A+B calibration
-  and the both-sticks emergency stop used by its trigger modules). This bridge does not publish
-  those. teleop_avatar has its own bindings on the frame's `controller_raw_datas`
-  (`pico.xyab`, `pico.dual_axis_click`), which may or may not be active on the `pico-ros2` link.
-  **Do not rely on the stick-click e-stop.**
-* **Whether head/controller poses must also be sent as joints.** The sample has empty
-  `left_hand`/`right_hand` lists, so by default only the 24 body joints are sent. An
-  experimental switch (`output.controller_pose_as_hand_joint`) exists; its joint code is a guess.
-* **`timestamp` unit.** The sample has a constant 4294967295. Default is Unix milliseconds
-  (`output.timestamp_mode`).
-* **`external_device`.** Default `GENIELINK` (strictest dead-man: both grips in upper-body
-  absolute mode). Other side effects of this tag are unknown.
-* Explicit-zero protobuf encoding on the ROS topic (matches the PICO byte layout; the canonical
-  proto3 form is available with `output.explicit_defaults: false`).
-* The robot's installed teleop profile is named `a3_lite`.
+```mermaid
+flowchart LR
+    T["Teleop session"] --> R["Episode recorder<br/>on the robot"]
+    Cam["Cameras<br/>head now, wrists later"] --> R
+    R --> S[("Short-term storage<br/>on the robot")]
+    S -- "upload, then delete" --> Srv["Your server"]
+    Srv --> D["LeRobot dataset<br/>for training"]
+```
 
-## First power-on checklist
+Two upload choices are foreseen: convert to the LeRobot format on the robot, or upload the
+raw recording and convert on the server.
 
-Two people. One does nothing but hold the emergency stop.
+## What is inside
 
-1. **Robot in damping (or on the hoist / e-stopped), hardware e-stop in hand and tested.**
-   Clear 2 m around the robot. Agree on a spoken "stop" word.
-2. Confirm with the robot's owner which teleop services are running (`hal_remote`,
-   teleop_avatar) and that nobody else is connected with a PICO or the phone app.
-3. PC and robot on the same network; run `python3 -m unittest` on both.
-4. Robot: start the bridge in **dry-run** with `--record`. PC: start the sender with `--fake`.
-   Check the statistics line: ~100 Hz valid, no rejects, sender IP as expected. Stop the sender
-   and confirm the bridge logs `WATCHDOG` and the would-publish rate drops to 0.
-5. Real headset, still **dry-run**: stand in a T-pose facing forward, record 10 s, then decode
-   the record and check against [docs/A3_FRAME_ANALYSIS.md](docs/A3_FRAME_ANALYSIS.md):
-   z is up (head ≈ 1.4–1.5 m above the feet), left wrist to the left of the right wrist with
-   forward × left = up, pelvis quaternion ≈ pure yaw, quaternion's local +x points where you
-   face, metres. Raise the left hand only, step forward, turn left – each must show up as the
-   expected axis. Fix `config/transform.json` until it does.
-6. Still dry-run: press every button, trigger, grip and stick direction one at a time and check
-   the decoded `VRButtonChannel` (controller 0 = left, key_one = X/A, key_two = Y/B, ranges
-   0..1 / −1..1). Check that an idle controller shows grip ≈ 0.
-7. Read-only on the robot: `ros2 topic info -v` on both topics. There must be **no other
-   publisher**. Note the subscribers.
-8. Only now, robot still in damping: start the bridge with `--publish`, **no grips pressed**,
-   hands off the sticks. Watch the robot's teleop logs/status for accepted frames, calibration
-   state and errors. Stop the bridge; confirm the robot reports input loss.
-9. Calibration and take-over only with the robot's normal procedure and its owner present, on
-   the hoist if available. First take-over: slow, small arm motions only; release the grips
-   to end the session; e-stop at the first unexpected motion.
-10. Afterwards: stop the bridge first, then the sender; write down what was verified and update
-    the lists above.
+| Path | What it is |
+|---|---|
+| `robot/teleop_service.py` | Control page server |
+| `web/index.html` | The control page |
+| `robot/teleop_bridge.py` | Bridge program: headset stream in, robot packets out |
+| `robot/bridge_core.py` | All checks and conversions, no network code (easy to test) |
+| `robot/a3_proto.py` | Writes and reads the robot's message formats by hand |
+| `robot/discovery.py` | Lets the headset app find the robot on the network |
+| `teleop_common/` | Headset-to-bridge packet format, coordinate maths |
+| `config/transform.json` | Every assumption about axes, scale and origin, in one file |
+| `tools/static_pose_test.py` | Sends a still pose with tiny, slow hand moves for a first careful test |
+| `tools/pcap_to_cap.py` | Turns a network capture into a test file |
+| `pc/` | Optional sender for a PC running XRoboToolkit (an alternative to the headset app) |
+| `tests/` | 120+ tests; none of them touch a real robot |
+| `docs/` | Details: [packet format](docs/WIRE_FORMAT.md), [discovery](docs/DISCOVERY.md), [frame analysis](docs/A3_FRAME_ANALYSIS.md) |
+
+## The packets, briefly
+
+**Headset to bridge** (`NTB1`, UDP port 39500): one small binary packet per frame with a
+sequence number, a checksum, head and controller poses, buttons and 24 body joints. Details in
+[docs/WIRE_FORMAT.md](docs/WIRE_FORMAT.md).
+
+**Bridge to robot** (UDP port 25618 on the robot itself): one `RobotFrameData` message per
+packet, the same message the vendor's headset app sends. It holds:
+
+- a timestamp in milliseconds and a frame counter,
+- 24 body joints, each with a position and an orientation,
+- three devices (left controller, right controller, head), each with buttons and a pose.
+
+Orientations are packed into 32 bits. The exact layout is documented at the top of the
+`RobotFrameData` section in [`robot/a3_proto.py`](robot/a3_proto.py). The robot drops packets
+that repeat a timestamp, so the bridge makes sure timestamps always rise.
+
+Positions use: **x forward, y left, z up, in metres**, measured from where the operator's head
+was when the stream started.
+
+A second live mode, `--publish`, writes straight to the robot's internal ROS 2 topics instead.
+It skips the robot's input program and with it the button rules above, so it is not the
+recommended path.
+
+## What is proven and what is not
+
+| | |
+|---|---|
+| ✅ | The robot packet writer reproduces 8,766 recorded packets of the vendor headset app **byte for byte** |
+| ✅ | The whole chain works on one machine: fake headset → bridge → stand-in robot listener |
+| ✅ | The control page reads the real robot's state; its buttons are tested against a stand-in robot |
+| ✅ | Checks, watchdog and sender lock are covered by tests |
+| ❌ | **The bridge has not driven the real robot yet** |
+| ❌ | The axis mapping between the headset app and the robot (`config/transform.json`) is still marked provisional |
+| ❌ | Data collection: only the settings exist |
+
+## First test on a real robot
+
+1. Robot hung up or otherwise safe, nobody within reach of the arms, emergency stop in hand.
+2. Control page: all three computers green, then **Start teleoperation mode**.
+3. **Start in test mode** and check the stream is healthy at about 100 frames a second.
+4. Stop, then **Start live**. Calibrate. Hold both grips briefly and watch one small movement.
+5. Release the grips. Then **Leave teleoperation mode**.
+
+For an even more careful first step, `tools/static_pose_test.py` sends a fixed pose and moves
+one hand by a few centimetres at most.
+
+## Test files that are not in git
+
+Two kinds of test data are recordings of vendor software and are kept out of the repository:
+`tests/data/pico_sample_*.cap` and `tests/data/genielink_sample.cap`. Tests that need them are
+skipped when they are missing. `tools/pcap_to_cap.py` makes the second one from your own
+network capture.
 
 ## Notes
 
-* **Test fixtures.** `tests/data/*.cap` are short excerpts (151 frames, body joint poses only)
-  of the vendor's sample recording shipped on the robot. They are NOT kept in git (`*.cap` is
-  ignored) because redistribution has not been cleared. Without them the five tests that need
-  them are skipped; everything else runs. On the robot they can be regenerated from the vendor
-  sample with `tools/capture_udp.py` and `pico_mock_player` on a private loopback port, and the
-  full-sample golden test is enabled with `NTB_FULL_SAMPLE=<full .cap>`.
-* An alternative integration – emitting the PICO UDP format straight to `hal_remote` so that
-  it produces all derived topics itself – was deliberately not implemented: it would mean
-  sending to the robot's live teleop port.
+- This is an independent project. It is not made or endorsed by AgiBot or PICO.
+- The robot's message formats were worked out from our own robot for interoperability. They
+  may change with robot software updates.

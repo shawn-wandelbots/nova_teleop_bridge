@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
-"""Robot-side teleop bridge: NTB1 UDP datagrams -> /remote/vr_data + /remote/vr_button.
+"""Robot-side teleop bridge: NTB1 UDP datagrams from the headset -> the robot's teleop input.
 
-DEFAULT IS --dry-run: nothing is published and ROS is not even imported.  Real publishing
-needs the explicit --publish flag AND the robot's ROS 2 environment (domain 232, see README).
+DEFAULT IS --dry-run: nothing is sent to the robot.  Two live modes exist:
 
-    python3 robot/teleop_bridge.py --port 39500 --record /tmp/out.rec          # dry run
-    python3 robot/teleop_bridge.py --port 39500 --sender-ip 192.168.1.50 --publish
+  --robot-input   (recommended) send each frame as one aimdk.protocol.RobotFrameData datagram
+                  to the robot's own teleop input port (hal_remote, UDP 25618), exactly like the
+                  vendor headset app.  The robot then does its own connection tracking, button
+                  combinations, grip deadman, calibration and watchdog.
+  --publish       publish /remote/vr_data + /remote/vr_button on ROS 2 directly (bypasses
+                  hal_remote; needs the robot's ROS 2 environment, domain 232).
+
+    python3 robot/teleop_bridge.py --record /tmp/out.rec                       # dry run
+    python3 robot/teleop_bridge.py --sender-ip 192.168.1.50 --robot-input
 
 Unless --no-discovery is given it also answers NTD1 discovery probes on --discovery-port
 (default 39501) so the headset app can find it; see docs/DISCOVERY.md.
@@ -21,6 +27,7 @@ Safety behaviour (details in README.md):
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import select
 import signal
@@ -31,13 +38,15 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from robot import a3_proto, discovery  # noqa: E402
 from robot.bridge_core import BridgeCore, Limits  # noqa: E402
-from robot.recording import KIND_VR_BUTTON, KIND_XR_FRAME, RecordWriter  # noqa: E402
+from robot.recording import KIND_ROBOT_FRAME, KIND_VR_BUTTON, KIND_XR_FRAME, RecordWriter  # noqa: E402
 from teleop_common.transform import load_config  # noqa: E402
 
 VR_DATA_TOPIC = a3_proto.ros_topic_name("/remote/vr_data", a3_proto.XR_FRAME_TYPE)
 VR_BUTTON_TOPIC = a3_proto.ros_topic_name("/remote/vr_button", a3_proto.VR_BUTTON_TYPE)
-# The robot's own live teleop ports. This program never binds or sends to them.
+# The robot's own live teleop ports. This program never binds them, and only ever sends to
+# ROBOT_INPUT_PORT, and only in --robot-input mode.
 FORBIDDEN_PORTS = (25618, 25619, 15000, 51000)
+ROBOT_INPUT_PORT = 25618
 DEFAULT_PORT = 39500
 DEFAULT_CONFIG = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                               "config", "transform.json")
@@ -54,11 +63,33 @@ class DryRunPublisher:
     def __init__(self):
         self.count = 0
 
-    def publish(self, xr_frame: bytes, vr_button: bytes) -> None:
+    def publish(self, out) -> None:
         self.count += 1
 
     def close(self) -> None:
         pass
+
+
+class RobotInputPublisher:
+    """Sends RobotFrameData datagrams to the robot's teleop input port (hal_remote)."""
+    dry_run = False
+
+    def __init__(self, host: str, port: int = ROBOT_INPUT_PORT):
+        self.count = 0
+        self.errors = 0
+        self._dest = (host, port)
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+    def publish(self, out) -> None:
+        try:
+            self._sock.sendto(out.robot_frame, self._dest)
+            self.count += 1
+        except OSError:
+            # e.g. "connection refused" while the robot's teleop input is not running
+            self.errors += 1
+
+    def close(self) -> None:
+        self._sock.close()
 
 
 class RosPublisher:
@@ -100,9 +131,9 @@ class RosPublisher:
         m.data = [bytes([x]) for x in payload]   # byte[] = list of 1-byte bytes objects
         return m
 
-    def publish(self, xr_frame: bytes, vr_button: bytes) -> None:
-        self._pub_data.publish(self._wrap(xr_frame))
-        self._pub_btn.publish(self._wrap(vr_button))
+    def publish(self, out) -> None:
+        self._pub_data.publish(self._wrap(out.xr_frame))
+        self._pub_btn.publish(self._wrap(out.vr_button))
         self.count += 1
 
     def close(self) -> None:
@@ -118,7 +149,14 @@ def build_parser() -> argparse.ArgumentParser:
                       help="decode/validate/encode only, publish nothing (DEFAULT)")
     mode.add_argument("--publish", dest="publish", action="store_true",
                       help="REALLY publish to the robot's ROS 2 topics")
+    mode.add_argument("--robot-input", action="store_true",
+                      help="REALLY send RobotFrameData to the robot's teleop input port (recommended live mode)")
     ap.set_defaults(publish=False)
+    ap.add_argument("--robot-input-host", default="127.0.0.1", help="where hal_remote listens (default %(default)s)")
+    ap.add_argument("--robot-input-port", type=int, default=ROBOT_INPUT_PORT,
+                    help="only change this for tests against a stand-in listener")
+    ap.add_argument("--status-file", default=None, metavar="FILE",
+                    help="write a small JSON status snapshot here every second (read by the web UI)")
     ap.add_argument("--listen-ip", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
     ap.add_argument("--sender-ip", default=None, help="only accept this source IP (default: first valid sender)")
@@ -157,12 +195,14 @@ def main(argv=None) -> int:
             ap.error("--discovery-port must be 1024..65535 and differ from --port")
     if a.resync_ms <= a.watchdog_ms:
         ap.error("--resync-ms must be larger than --watchdog-ms")
+    live = a.publish or a.robot_input
+    mode_name = "ROBOT-INPUT" if a.robot_input else "PUBLISH" if a.publish else "DRY-RUN"
     limits = Limits(watchdog_ms=a.watchdog_ms, resume_frames=max(1, a.resume_frames), resync_ms=a.resync_ms,
                     max_abs_position_m=a.max_abs_position, max_speed_mps=a.max_speed, min_jump_m=a.min_jump,
                     require_body=not a.allow_no_body,
-                    allow_synthetic=(not a.publish) or a.allow_synthetic)
+                    allow_synthetic=(not live) or a.allow_synthetic)
     cfg = load_config(a.config)
-    core = BridgeCore(cfg, limits, sender_ip=a.sender_ip, log=log)
+    core = BridgeCore(cfg, limits, sender_ip=a.sender_ip, log=log, robot_frame=True)
 
     stop = {"flag": False, "sig": None}
 
@@ -177,7 +217,10 @@ def main(argv=None) -> int:
     sock.setblocking(False)
 
     recorder = RecordWriter(a.record) if a.record else None
-    publisher = RosPublisher(a.allow_other_publishers) if a.publish else DryRunPublisher()
+    if a.robot_input:
+        publisher = RobotInputPublisher(a.robot_input_host, a.robot_input_port)
+    else:
+        publisher = RosPublisher(a.allow_other_publishers) if a.publish else DryRunPublisher()
 
     # Discovery responder (docs/DISCOVERY.md). Read-only: it reports mode and lock state and
     # never touches the bridge core. A port that cannot be bound only disables discovery.
@@ -185,7 +228,7 @@ def main(argv=None) -> int:
     if a.discovery:
         model, robot_id = discovery.read_robot_identity()
         responder = discovery.DiscoveryResponder(
-            a.port, lambda: (discovery.MODE_PUBLISH if a.publish else discovery.MODE_DRY_RUN,
+            a.port, lambda: (discovery.MODE_PUBLISH if live else discovery.MODE_DRY_RUN,
                              core.sender_ip is not None),
             model=model, robot_id=robot_id)
         try:
@@ -196,15 +239,36 @@ def main(argv=None) -> int:
     read_socks = [sock] + ([disco] if disco else [])
 
     log("mode=%s listen=%s:%d sender=%s config=%s (%s)" % (
-        "PUBLISH" if a.publish else "DRY-RUN", a.listen_ip, a.port, a.sender_ip or "first-seen",
+        mode_name, a.listen_ip, a.port, a.sender_ip or "first-seen",
         a.config, cfg.get("status", "?")))
-    log("topics: %s , %s" % (VR_DATA_TOPIC, VR_BUTTON_TOPIC))
+    if a.robot_input:
+        log("robot input: RobotFrameData -> UDP %s:%d" % (a.robot_input_host, a.robot_input_port))
+    else:
+        log("topics: %s , %s" % (VR_DATA_TOPIC, VR_BUTTON_TOPIC))
     log("discovery: %s" % ("answering NTD1 probes on UDP %d" % disco.port if disco else "off"))
-    if a.publish:
-        log("*** LIVE: publishing to the robot. Keep the e-stop within reach. ***")
+    if live:
+        log("*** LIVE: sending to the robot. Keep the e-stop within reach. ***")
+
+    def write_status(now_s, rates):
+        if not a.status_file:
+            return
+        snap = {"t": time.time(), "mode": mode_name.lower(), "state": "active" if core.active else "stopped",
+                "sender": core.sender_ip, "listen_port": a.port, "sent": publisher.count,
+                "send_errors": getattr(publisher, "errors", 0), "watchdog_trips": core.stats["watchdog_trips"],
+                "last_reject": core.last_reason, "config_status": cfg.get("status", "?")}
+        snap.update(rates)
+        try:
+            tmp = a.status_file + ".tmp"
+            with open(tmp, "w") as fh:
+                json.dump(snap, fh)
+            os.replace(tmp, a.status_file)
+        except OSError:
+            pass
 
     t_start = time.monotonic()
     t_stats = t_start
+    t_status = t_start
+    status_prev = (0, 0, 0)
     last_stats = dict(core.stats)
     last_pub = 0
     lat_ms = []
@@ -236,13 +300,21 @@ def main(argv=None) -> int:
                         newest = out
             core.tick(now)
             if newest is not None and core.active and not stop["flag"]:
-                publisher.publish(newest.xr_frame, newest.vr_button)
+                publisher.publish(newest)
                 core.stats["out"] += 1
                 t_ns = time.time_ns()
                 lat_ms.append((t_ns - newest.t_send_ns) / 1e6)
                 if recorder:
                     recorder.write(KIND_XR_FRAME, t_ns, newest.xr_frame)
                     recorder.write(KIND_VR_BUTTON, t_ns, newest.vr_button)
+                    recorder.write(KIND_ROBOT_FRAME, t_ns, newest.robot_frame)
+            if a.status_file and now - t_status >= 1.0:
+                dt = now - t_status
+                cur = (core.stats["rx"], core.stats["valid"], publisher.count)
+                write_status(now, {"rx_hz": round((cur[0] - status_prev[0]) / dt, 1),
+                                   "valid_hz": round((cur[1] - status_prev[1]) / dt, 1),
+                                   "out_hz": round((cur[2] - status_prev[2]) / dt, 1)})
+                t_status, status_prev = now, cur
             if a.stats_interval and now - t_stats >= a.stats_interval:
                 dt = now - t_stats
                 s = core.stats
@@ -251,10 +323,10 @@ def main(argv=None) -> int:
                 lat = ("%.1f/%.1f" % (sum(lat_ms) / len(lat_ms), max(lat_ms))) if lat_ms else "-"
                 log("%s rx %.1f Hz | valid %.1f Hz | %s %.1f Hz | rejects %s | seq gaps %d | watchdog trips %d | "
                     "sender->robot clock delta avg/max ms %s | state %s" % (
-                        "PUBLISH" if a.publish else "DRY-RUN",
+                        mode_name,
                         (s["rx"] - last_stats.get("rx", 0)) / dt,
                         (s["valid"] - last_stats.get("valid", 0)) / dt,
-                        "published" if a.publish else "would-publish", (publisher.count - last_pub) / dt,
+                        "sent" if live else "would-send", (publisher.count - last_pub) / dt,
                         rej or "none", s["seq_gaps"], s["watchdog_trips"], lat,
                         "ACTIVE" if core.active else "STOPPED"))
                 t_stats, last_stats, last_pub, lat_ms = now, dict(s), publisher.count, []
@@ -263,6 +335,11 @@ def main(argv=None) -> int:
         sock.close()
         if disco is not None:
             disco.close()
+        if a.status_file:
+            try:
+                os.remove(a.status_file)
+            except OSError:
+                pass
         if recorder:
             recorder.close()
         total = publisher.count
@@ -270,7 +347,7 @@ def main(argv=None) -> int:
         s = core.stats
         log("exit (%s): rx=%d valid=%d %s=%d rejects=%s watchdog_trips=%d" % (
             signal.Signals(stop["sig"]).name if stop["sig"] else "done", s["rx"], s["valid"],
-            "published" if a.publish else "would-publish", total,
+            "sent" if live else "would-send", total,
             {k[7:]: v for k, v in s.items() if k.startswith("reject_")} or "none", s["watchdog_trips"]))
         if disco is not None:
             log("discovery: %s" % (dict(disco.responder.stats) or "no probes"))

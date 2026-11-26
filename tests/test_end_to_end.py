@@ -55,6 +55,7 @@ class TestEndToEnd(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = load_config(CONFIG)
             cfg["output"]["timestamp_mode"] = "sdk_ns"         # lets the test recover the fake's tick index
+            cfg["output"]["origin"] = "fixed"
             cfg_path = os.path.join(tmp, "cfg.json")
             with open(cfg_path, "w") as fh:
                 json.dump(cfg, fh)
@@ -63,7 +64,7 @@ class TestEndToEnd(unittest.TestCase):
             self.assertIn("sent=250", sender.stdout)
             self.assertEqual(rc, 0, log)
             self.assertIn("exit (SIGINT)", log)
-            self.assertIn("would-publish", log)
+            self.assertIn("would-send", log)
             self.assertIn("WATCHDOG", log)                     # sender stopped -> bridge went silent
             self.assertNotIn("PUBLISH rx", log)
             records = read_record(rec)
@@ -112,6 +113,7 @@ class TestEndToEnd(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = load_config(CONFIG)
             cfg["output"]["timestamp_mode"] = "sdk_ns"
+            cfg["output"]["origin"] = "fixed"
             cfg_path = os.path.join(tmp, "cfg.json")
             with open(cfg_path, "w") as fh:
                 json.dump(cfg, fh)

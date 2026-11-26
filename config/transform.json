@@ -67,6 +67,10 @@
     "timestamp_mode": "unix_ms",
     "_external_device_note": "UNKNOWN | YUANJI_APP | GENIELINK. GENIELINK makes the robot require BOTH grips for take-over in upper-body absolute mode (strictest).",
     "external_device": "GENIELINK",
+    "_origin_note": "fixed | first_head. first_head measures every position from where the head was when the stream started, like the vendor headset app (head height is z = 0).",
+    "origin": "first_head",
+    "_robot_frame_quaternion_note": "compressed | plain | both: which orientation field is written in RobotFrameData (--robot-input). The vendor headset app writes only the compressed one.",
+    "robot_frame_quaternion": "compressed",
     "explicit_defaults": true,
     "_pose_joints_note": "EXPERIMENTAL/UNVERIFIED: also emit the controller poses as one Joint each in left_hand/right_hand. Off by default; the PICO sample has empty hand lists.",
     "controller_pose_as_hand_joint": false

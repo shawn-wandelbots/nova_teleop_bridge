@@ -3,7 +3,8 @@
 1. Bridge record (``teleop_bridge.py --record``):
        file header  : 8 bytes  b"NTBREC1\\n"
        per record   : <B kind> <Q t_unix_ns> <I length> <payload>
-       kind 1 = encoded aimdk.protocol.XRFrameData, kind 2 = aimdk.protocol.VRButtonChannel
+       kind 1 = encoded aimdk.protocol.XRFrameData, kind 2 = aimdk.protocol.VRButtonChannel,
+       kind 3 = aimdk.protocol.RobotFrameData
 2. Raw capture (``tools/capture_udp.py``):
        file header  : 8 bytes  b"NTBCAP1\\n"
        per record   : <Q t_monotonic_ns since first datagram> <I length> <datagram>
@@ -14,6 +15,7 @@ REC_MAGIC = b"NTBREC1\n"
 CAP_MAGIC = b"NTBCAP1\n"
 KIND_XR_FRAME = 1
 KIND_VR_BUTTON = 2
+KIND_ROBOT_FRAME = 3
 _REC_HDR = struct.Struct("<BQI")
 _CAP_HDR = struct.Struct("<QI")
 

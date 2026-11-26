@@ -1,4 +1,4 @@
-"""Hand-rolled protobuf codec for the two AgiBot A3 teleop input messages.
+"""Hand-rolled protobuf codec for the AgiBot A3 teleop input messages.
 
 The robot's system Python has no ``protobuf`` package, so (like the robot's own
 helper scripts) the wire format is produced by hand.  Only what is needed for
@@ -6,7 +6,8 @@ helper scripts) the wire format is produced by hand.  Only what is needed for
     aimdk.protocol.XRFrameData       (topic /remote/vr_data)
     aimdk.protocol.VRButtonChannel   (topic /remote/vr_button)
 
-is implemented.  Schemas (proto3, recovered from the robot's binaries):
+and, further down, aimdk.protocol.RobotFrameData (what a headset sends to the robot's
+own teleop input port) are implemented.  Schemas (proto3, recovered from the robot's binaries):
 
     XRFrameData      { uint64 timestamp=1; repeated Joint left_hand=2;
                        repeated Joint right_hand=3; repeated Joint body_data=4;
@@ -308,3 +309,165 @@ def decode_vr_buttons(buf: bytes) -> VRButtons:
         elif fieldno == 3 and wire == 0:
             b.external_device = val
     return b
+
+
+# ======================================================================================
+# aimdk.protocol.RobotFrameData: one message per UDP datagram to the robot's teleop input
+# port (hal_remote).  Schema (proto3 with explicit presence, from the robot's own binary):
+#
+#   RobotFrameData  { uint64 timestamp=1 (unix ms); uint64 frame_index=2;
+#                     repeated Joint left_hand=100; repeated Joint right_hand=101;
+#                     repeated Joint body_data=102; repeated DeviceInputData device_inputs=103;
+#                     Vector3 chassis_movement=104; }
+#   Joint           { joint_code_types joint_code=1; PointPose point_pose=2; }
+#   PointPose       { Vector3 position=1; Quaternion quaternion=2; uint32 quaternion_compressed=3; }
+#   DeviceInputData { DeviceType device_type=1 (0 left, 1 right, 2 head); bool axis_click=2;
+#                     float axis_x=3; float axis_y=4; float index_trig=5; float hand_trig=6;
+#                     bool key_one=7; bool key_two=8; PointPose point_pose=9; }
+#
+# quaternion_compressed ("smallest three", worked out from recorded traffic):
+#   bits 31..30  index of the component with the largest magnitude (0=x 1=y 2=z 3=w); it is
+#                left out and taken as positive
+#   3 x 10 bits  the other components in x,y,z,w order: 1 sign bit (1 = negative) and a
+#                9-bit magnitude, 511 = 1/sqrt(2)
+# ======================================================================================
+DEVICE_LEFT, DEVICE_RIGHT, DEVICE_HEAD = 0, 1, 2
+_Q_SCALE = 0.7071067811865476
+QUAT_MODES = ("compressed", "plain", "both")
+
+
+@dataclass
+class DeviceInput:
+    device_type: int = DEVICE_LEFT
+    axis_click: bool = False
+    axis_x: float = 0.0
+    axis_y: float = 0.0
+    index_trig: float = 0.0
+    hand_trig: float = 0.0
+    key_one: bool = False
+    key_two: bool = False
+    pos: Optional[Tuple[float, float, float]] = None
+    quat: Optional[Tuple[float, float, float, float]] = None   # x, y, z, w
+
+
+@dataclass
+class RobotFrame:
+    timestamp: int = 0
+    frame_index: int = 0
+    left_hand: List[Joint] = field(default_factory=list)
+    right_hand: List[Joint] = field(default_factory=list)
+    body: List[Joint] = field(default_factory=list)
+    devices: List[DeviceInput] = field(default_factory=list)
+    chassis: Optional[Tuple[float, float, float]] = None
+
+
+def compress_quat(q) -> int:
+    """x, y, z, w -> the 32-bit packed form described above."""
+    n = sum(v * v for v in q) ** 0.5
+    if not n > 0.0:
+        raise ProtoError("zero quaternion")
+    q = [v / n for v in q]
+    big = max(range(4), key=lambda i: abs(q[i]))
+    if q[big] < 0.0:
+        q = [-v for v in q]
+    out = big
+    for i in range(4):
+        if i == big:
+            continue
+        mag = min(511, int(round(abs(q[i]) / _Q_SCALE * 511.0)))
+        out = out << 10 | ((0x200 if q[i] < 0.0 and mag else 0) | mag)
+    return out
+
+
+def decompress_quat(u: int) -> Tuple[float, float, float, float]:
+    big = (u >> 30) & 3
+    parts = [(u >> 20) & 0x3FF, (u >> 10) & 0x3FF, u & 0x3FF]
+    vals = [(-1.0 if p & 0x200 else 1.0) * (p & 0x1FF) / 511.0 * _Q_SCALE for p in parts]
+    rest = max(0.0, 1.0 - sum(v * v for v in vals)) ** 0.5
+    q = []
+    for i in range(4):
+        q.append(rest if i == big else vals.pop(0))
+    return tuple(q)
+
+
+def _encode_point_pose(pos, quat, quat_mode: str) -> bytes:
+    out = b""
+    if pos is not None:
+        out += _ld(1, b"".join(_f32(i + 1, v, True) for i, v in enumerate(pos)))
+    if quat is not None:
+        if quat_mode in ("plain", "both"):
+            out += _ld(2, b"".join(_f32(i + 1, v, True) for i, v in enumerate(quat)))
+        if quat_mode in ("compressed", "both"):
+            out += _vint(3, quat if isinstance(quat, int) else compress_quat(quat), True)
+    return out
+
+
+def encode_robot_frame(f: RobotFrame, quat_mode: str = "compressed") -> bytes:
+    """Every scalar is written, zeros included, exactly as the vendor headset app does.
+    A quaternion given as an int is taken as already packed (used to re-encode captures)."""
+    if quat_mode not in QUAT_MODES:
+        raise ValueError("quat_mode must be one of %s" % (QUAT_MODES,))
+    out = bytearray(_vint(1, f.timestamp, True) + _vint(2, f.frame_index, True))
+    for fieldno, joints in ((100, f.left_hand), (101, f.right_hand), (102, f.body)):
+        for j in joints:
+            out += _ld(fieldno, _vint(1, j.code, True) + _ld(2, _encode_point_pose(j.pos, j.quat, quat_mode)))
+    for d in f.devices:
+        out += _ld(103, _vint(1, d.device_type, True)
+                   + _vint(2, 1 if d.axis_click else 0, True)
+                   + _f32(3, d.axis_x, True) + _f32(4, d.axis_y, True)
+                   + _f32(5, d.index_trig, True) + _f32(6, d.hand_trig, True)
+                   + _vint(7, 1 if d.key_one else 0, True) + _vint(8, 1 if d.key_two else 0, True)
+                   + _ld(9, _encode_point_pose(d.pos, d.quat, quat_mode)))
+    if f.chassis is not None:
+        out += _ld(104, b"".join(_f32(i + 1, v, True) for i, v in enumerate(f.chassis)))
+    return bytes(out)
+
+
+def _decode_point_pose(buf: bytes, keep_packed: bool):
+    pos = quat = None
+    for fieldno, wire, val in _fields(buf):
+        if fieldno == 1 and wire == 2:
+            pos = _decode_floats(val, 3, (0.0, 0.0, 0.0))
+        elif fieldno == 2 and wire == 2:
+            quat = _decode_floats(val, 4, (0.0, 0.0, 0.0, 0.0))
+        elif fieldno == 3 and wire == 0 and quat is None:
+            quat = val if keep_packed else decompress_quat(val)
+    return pos, quat
+
+
+def decode_robot_frame(buf: bytes, keep_packed: bool = False) -> RobotFrame:
+    """keep_packed=True leaves packed quaternions as ints, so encode gives the same bytes back."""
+    f = RobotFrame()
+    for fieldno, wire, val in _fields(buf):
+        if wire == 0 and fieldno == 1:
+            f.timestamp = val
+        elif wire == 0 and fieldno == 2:
+            f.frame_index = val
+        elif wire == 2 and fieldno in (100, 101, 102):
+            j = Joint(code=0, pos=None, quat=None)
+            for ff, ww, vv in _fields(val):
+                if ff == 1 and ww == 0:
+                    j.code = _signed32(vv)
+                elif ff == 2 and ww == 2:
+                    j.pos, j.quat = _decode_point_pose(vv, keep_packed)
+            {100: f.left_hand, 101: f.right_hand, 102: f.body}[fieldno].append(j)
+        elif wire == 2 and fieldno == 103:
+            d = DeviceInput()
+            for ff, ww, vv in _fields(val):
+                if ww == 0:
+                    if ff == 1:
+                        d.device_type = _signed32(vv)
+                    elif ff == 2:
+                        d.axis_click = bool(vv)
+                    elif ff == 7:
+                        d.key_one = bool(vv)
+                    elif ff == 8:
+                        d.key_two = bool(vv)
+                elif ww == 5 and 3 <= ff <= 6:
+                    setattr(d, ("axis_x", "axis_y", "index_trig", "hand_trig")[ff - 3], _F32.unpack(vv)[0])
+                elif ww == 2 and ff == 9:
+                    d.pos, d.quat = _decode_point_pose(vv, keep_packed)
+            f.devices.append(d)
+        elif wire == 2 and fieldno == 104:
+            f.chassis = _decode_floats(val, 3, (0.0, 0.0, 0.0))
+    return f

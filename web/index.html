@@ -202,7 +202,8 @@ ul.how b { color: var(--text); font-weight: 600; }
       joint data, keeps the episode only until your server has confirmed it is stored intact, then deletes its own copy.</p>
     <div class="row">
       <button class="primary" id="b-rec-start">Start recording</button>
-      <button class="danger" id="b-rec-stop">Stop recording</button>
+      <button class="danger" id="b-rec-stop">Stop and keep</button>
+      <button id="b-rec-discard">Delete episode</button>
       <span class="pill" id="p-rec">Recording: …</span>
     </div>
     <div class="grid" style="margin-top:14px">
@@ -212,6 +213,7 @@ ul.how b { color: var(--text); font-weight: 600; }
       <div class="stat"><div class="k">Free space on robot</div><div class="v" id="s-rec-free">–</div></div>
     </div>
     <div id="rec-note"></div>
+    <p id="rec-keys" style="color:var(--text-muted);margin:12px 0 0"></p>
     <details><summary>What is recorded</summary><pre id="rec-topics">–</pre></details>
   </section>
 
@@ -259,7 +261,12 @@ ul.how b { color: var(--text); font-weight: 600; }
         </div>
         <div><label>&nbsp;</label>
           <label class="check"><input type="checkbox" id="c-keep"> Keep a copy on the robot after upload</label></div>
+        <div><label for="k-start">Key: start recording</label><input type="text" id="k-start" class="hotkey" readonly placeholder="click, then press a key"></div>
+        <div><label for="k-stop">Key: stop and keep</label><input type="text" id="k-stop" class="hotkey" readonly placeholder="click, then press a key"></div>
+        <div><label for="k-discard">Key: delete episode</label><input type="text" id="k-discard" class="hotkey" readonly placeholder="click, then press a key"></div>
       </div>
+      <p style="color:var(--text-muted);margin:10px 0 0">For a foot pedal: give each pedal one of these keys in the pedal's own software.
+        The keys only work while this page is the active window. Backspace in a key field clears it.</p>
       <div class="row" style="margin-top:16px">
         <button class="primary" type="submit">Save settings</button>
         <span id="save-msg" style="color:var(--text-muted)"></span>
@@ -359,21 +366,72 @@ function render(s) {
 
 }
 
+// ---- recording actions, shared by buttons and hotkeys ----
+let lastRec = null, ownAction = false, audio = null;
+function beep(kind) {
+  // start: one high tone. stop: two rising tones. delete: one long low tone. error: three short low ones.
+  const pat = { start: [[880, 0.15]], stop: [[660, 0.1], [990, 0.15]], discard: [[220, 0.45]], error: [[180, 0.08], [180, 0.08], [180, 0.08]] }[kind];
+  try {
+    audio = audio || new (window.AudioContext || window.webkitAudioContext)();
+    let t = audio.currentTime;
+    for (const [f, dur] of pat) {
+      const o = audio.createOscillator(), g = audio.createGain();
+      o.frequency.value = f; g.gain.value = 0.25; o.connect(g); g.connect(audio.destination);
+      o.start(t); o.stop(t + dur); t += dur + 0.06;
+    }
+  } catch (e) { /* no sound available */ }
+}
+async function recAction(kind) {
+  if (!last || !last.data || $("app").hidden) return;
+  const d = last.data;
+  if (kind === "start" && d.recording) return beep("error");
+  if (kind === "stop" && !d.recording) return beep("error");
+  ownAction = true;
+  const j = await post("/api/record/" + kind);
+  if (!j) { ownAction = false; return beep("error"); }
+  beep(kind);
+  if (kind === "discard") toast("Episode " + j.episode.id + " deleted.");
+}
+function keyName(ev) {
+  if (["Control", "Alt", "Shift", "Meta"].includes(ev.key)) return "";
+  return (ev.ctrlKey ? "Ctrl+" : "") + (ev.altKey ? "Alt+" : "") + (ev.shiftKey ? "Shift+" : "") + (ev.metaKey ? "Meta+" : "") + ev.code;
+}
+window.addEventListener("keydown", ev => {
+  const t = ev.target;
+  if (t && t.classList && t.classList.contains("hotkey")) {          // choosing a key in Settings
+    if (ev.key === "Tab") return;
+    ev.preventDefault();
+    if (ev.key === "Backspace" || ev.key === "Delete") t.value = "";
+    else { const k = keyName(ev); if (k) t.value = k; }
+    return;
+  }
+  if (ev.repeat || !last || !last.settings) return;
+  const hk = last.settings.data_collection.hotkeys, k = keyName(ev);
+  if (!k) return;
+  for (const kind of ["start", "stop", "discard"]) if (hk[kind] && hk[kind] === k) { ev.preventDefault(); recAction(kind); return; }
+});
+
 function mb(n) { return n >= 1e9 ? (n / 1e9).toFixed(2) + " GB" : (n / 1e6).toFixed(1) + " MB"; }
 function renderData(d, set) {
   if (!d) return;
   const up = d.upload, noServer = !set.server_url;
   $("b-rec-start").disabled = d.recording || !d.enabled;
   $("b-rec-stop").disabled = !d.recording;
+  $("b-rec-discard").disabled = !d.recording && !(d.last_episode && !d.last_episode.discarded);
+  $("b-rec-discard").textContent = d.recording ? "Delete this episode" : "Delete last episode";
+  const hk = set.hotkeys;
+  $("rec-keys").textContent = "Keys while this page is active: " + (hk.start || "–") + " start · " + (hk.stop || "–") + " stop and keep · " + (hk.discard || "–") + " delete.";
+  if (lastRec !== null && lastRec !== d.recording && !ownAction) beep(d.recording ? "start" : "stop");
+  lastRec = d.recording; ownAction = false;
   pill($("p-rec"), "Recording: " + (d.recording ? "ON" : !d.enabled ? "switched off in Settings" : "off"), d.recording ? "live" : "");
   $("s-rec-ep").textContent = d.recording ? Math.round(d.episode.seconds) + " s · " + mb(d.episode.bytes)
-    : d.last_episode ? "Last: " + Math.round(d.last_episode.duration_s) + " s · " + mb(d.last_episode.bytes) : "–";
+    : d.last_episode ? (d.last_episode.discarded ? "Last: deleted" : "Last: " + Math.round(d.last_episode.duration_s) + " s · " + mb(d.last_episode.bytes)) : "–";
   $("s-rec-pend").textContent = d.pending.count ? d.pending.count + " · " + mb(d.pending.bytes) : "None";
   $("s-rec-up").textContent = noServer ? "No server set" : up.state === "uploading" ? "Sending " + Math.round(100 * up.sent_bytes / Math.max(1, up.total_bytes)) + " %"
     : up.state === "waiting" ? "Will retry" : up.last_ok ? "All stored" : "Idle";
   $("s-rec-free").textContent = d.free_gb + " GB";
   let n = "", kind = "";
-  if (d.last_episode && d.last_episode.warnings.length && !d.recording) { n = "Last episode: " + d.last_episode.warnings.join("; ") + "."; kind = "err"; }
+  if (d.last_episode && !d.last_episode.discarded && d.last_episode.warnings.length && !d.recording) { n = "Last episode: " + d.last_episode.warnings.join("; ") + "."; kind = "err"; }
   if (up.state === "waiting" && up.error) { n = "Upload is not working yet (" + up.error + "). Episodes stay on the robot and the upload is retried."; kind = "err"; }
   else if (noServer && d.pending.count) { n = "No upload server is set, so episodes stay on the robot."; kind = "info"; }
   note($("rec-note"), n, kind);
@@ -390,6 +448,7 @@ function fillSettings(s) {
   $("c-dc-on").checked = d.enabled; $("c-keep").checked = d.keep_local_copy;
   $("c-chest").checked = d.cameras.chest; $("c-waist").checked = d.cameras.waist; $("c-armpit").checked = d.cameras.armpit_right;
   $("c-wl").checked = d.cameras.wrist_left; $("c-wr").checked = d.cameras.wrist_right;
+  $("k-start").value = d.hotkeys.start; $("k-stop").value = d.hotkeys.stop; $("k-discard").value = d.hotkeys.discard;
 }
 
 function show(which) {
@@ -437,8 +496,11 @@ $("b-bridge-live").onclick = () => {
     post("/api/bridge/start", { mode: "live" });
 };
 $("b-bridge-stop").onclick = () => post("/api/bridge/stop");
-$("b-rec-start").onclick = () => post("/api/record/start");
-$("b-rec-stop").onclick = () => post("/api/record/stop");
+$("b-rec-start").onclick = () => recAction("start");
+$("b-rec-stop").onclick = () => recAction("stop");
+$("b-rec-discard").onclick = () => {
+  if (confirm(last.data.recording ? "Delete the episode being recorded?" : "Delete the last episode?")) recAction("discard");
+};
 $("f-settings").onsubmit = async ev => {
   ev.preventDefault();
   const body = {
@@ -450,7 +512,8 @@ $("f-settings").onsubmit = async ev => {
       max_spool_gb: Number($("i-spool").value), min_free_gb: Number($("i-minfree").value),
       keep_local_copy: $("c-keep").checked,
       cameras: { chest: $("c-chest").checked, waist: $("c-waist").checked, armpit_right: $("c-armpit").checked,
-                 wrist_left: $("c-wl").checked, wrist_right: $("c-wr").checked }
+                 wrist_left: $("c-wl").checked, wrist_right: $("c-wr").checked },
+      hotkeys: { start: $("k-start").value, stop: $("k-stop").value, discard: $("k-discard").value }
     }
   };
   const j = await post("/api/settings", body);

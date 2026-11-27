@@ -11,6 +11,8 @@ and comparing size and SHA-256 with the robot's list.
     GET  /api/episodes/<id>                       files already stored (lets an upload resume)
     PUT  /api/episodes/<id>/files/<path>          one file; header X-Sha256 must match the body
     POST /api/episodes/<id>/commit                body = manifest; answers with the receipt
+    POST /api/episodes/<id>/discard               the operator threw the episode away: it is
+                                                  moved to <root>/discarded/, not erased
 
 Every request needs the header ``X-Nova-Token``.  Stdlib only.  Traffic is not encrypted:
 use it on a network you trust.
@@ -185,6 +187,21 @@ class Handler(BaseHTTPRequestHandler):
         if not self._auth():
             return
         ep, rest = self._episode(self.path.split("?", 1)[0])
+        if ep is not None and rest == "discard":
+            self.rfile.read(min(int(self.headers.get("Content-Length") or 0), 65536))
+            src = os.path.join(self.root, "episodes", ep)
+            if not os.path.isdir(src):
+                return self._send(404, {"error": "the server has no episode %s" % ep})
+            os.makedirs(os.path.join(self.root, "discarded"), exist_ok=True)
+            dst, n = os.path.join(self.root, "discarded", ep), 1
+            while os.path.exists(dst):
+                n += 1
+                dst = os.path.join(self.root, "discarded", "%s_%d" % (ep, n))
+            try:
+                os.replace(src, dst)
+            except OSError as e:
+                return self._send(500, {"error": "could not move the episode: %s" % e})
+            return self._send(200, {"ok": True, "episode": ep, "discarded": True})
         if ep is None or rest != "commit":
             self.close_connection = True
             return self._send(404, {"error": "not found"})

@@ -173,8 +173,25 @@ What is on the page:
 
 ## Recording episodes for training
 
-One **episode** is one attempt at a task. *Start recording* and *Stop recording* on the control
-page mark its beginning and end. Closing the connection in the headset also ends it.
+One **episode** is one attempt at a task. Three actions on the control page control it, each
+with a button and a key:
+
+| Action | Key | Sound | What happens |
+|---|---|---|---|
+| Start recording | F8 | one high tone | A new episode begins |
+| Stop and keep | F9 | two rising tones | The episode is closed and queued for upload |
+| Delete episode | F10 | one long low tone | The episode being recorded, or else the last one, is thrown away |
+
+Three short low tones mean "that did not work" (for example *start* while already recording).
+Closing the connection in the headset also ends the episode.
+
+**Foot pedal.** Give each pedal one of the keys in the pedal's own software (for an Elgato
+pedal: a *Hotkey* action per pedal). The keys can be changed in Settings. They only work while
+the control page is the active browser window, so click the page once before you start.
+
+**Delete is careful.** One press deletes one episode and a second press does nothing, so the
+episode before can never be lost by accident. An episode that already reached the server is
+not erased there: the server moves it to its `discarded` folder.
 
 ```mermaid
 flowchart LR
@@ -184,7 +201,7 @@ flowchart LR
     S -- "1. send each file<br/>with its checksum" --> Srv["Your server"]
     Srv -- "2. receipt: every file read<br/>back from disk and checked" --> S
     S -- "3. only now" --> Del["Robot deletes<br/>its copy"]
-    Srv --> D["LeRobot dataset<br/><i>conversion: not built yet</i>"]
+    Srv --> D["LeRobot dataset<br/><i>server/to_lerobot.py</i>"]
 ```
 
 **What is in an episode**
@@ -200,9 +217,13 @@ Raw data comes first: nothing is re-encoded, resampled or reformatted on the rob
 stays in the camera program's own H.265 stream, and each video message keeps the camera's own
 timestamp.
 
-**What is recorded today** (see `config/recording.json`): the compressed video of the chest,
-waist and right armpit cameras, the joint states of arms, hands, waist, neck and legs, and the
-motion commands. Together this is about 2.7 MB per second, roughly 10 GB per hour.
+**What is recorded today** (see `config/recording.json`): the compressed video of the chest
+and waist cameras, the joint states and joint commands of arms, hands, waist, neck and legs,
+and the operator input as the robot received it. This is about 1.2 MB per second.
+
+**The right armpit camera is switched off by default.** Its complete pictures (key frames)
+are too large to reach the head computer intact, so most of them are lost and the video in
+between cannot be decoded. It can be switched on in Settings, but expect unusable video.
 
 **What is not recorded: depth.** On the A3 the depth pictures cannot be received on the head
 computer where this service runs. Worse, merely listening for them makes the robot's own
@@ -217,6 +238,11 @@ topics in its configuration. Wrist cameras are prepared as a setting and need ca
   when space runs low or the temporary storage limit is reached.
 - A half-written episode (power cut) is never uploaded and never deleted automatically.
 
+**Lost pictures.** Video travels inside the robot without a delivery guarantee, and now and
+then a picture is lost on the way to the recorder. The pictures after it, up to the camera's
+next key frame (at most one second for chest and waist), cannot be decoded correctly. The raw
+episode keeps exactly what arrived; the converter below reports every such loss.
+
 **The server side** is one file with no dependencies:
 
 ```bash
@@ -226,6 +252,34 @@ python3 server/ingest_server.py --root ~/nova_teleop_data --token <a secret of y
 Put the server's address (`http://<server>:8095`) and the same secret into Settings on the
 control page. Episodes land in `<root>/episodes/<episode>/` with a `receipt.json` next to them.
 The link is not encrypted: use it on a network you trust.
+
+## Making a LeRobot dataset
+
+On the server, `server/to_lerobot.py` builds a LeRobot dataset (format v2.1) from the stored
+episodes. The episodes themselves are never changed, so the dataset can be rebuilt at any time
+with other choices.
+
+```bash
+pip install -r server/requirements.txt      # numpy, pyarrow, mcap, mcap-ros2-support; also needs ffmpeg
+python3 server/to_lerobot.py --out ~/nova_teleop_data/lerobot/my_task --cameras chest_front_d457,waist_front_d415
+```
+
+A LeRobot dataset is one table with one row per video picture, while the robot's streams each
+run on their own clock. The converter therefore decides, and writes into
+`conversion_report.json`, the following:
+
+| Question | Answer |
+|---|---|
+| When does an episode start? | When every chosen camera has delivered a complete picture and joint data exists |
+| Which picture belongs to a row? | The one closest in time, from each camera |
+| Which joint reading is the state? | The newest one at or before the row's time, never a later one |
+| What is the action? | The newest joint command at or before the row's time. Without recorded commands: the next row's state, and the report says so |
+| What if pictures were lost? | The rows repeat the last good picture. If more than 1.1 s in a row is affected, the episode is left out |
+| Which episodes are used? | Those with a receipt and without recording warnings. Deleted episodes are not in the folder any more |
+
+State and action hold arms, hands, waist and neck (39 values), named after the robot's joints.
+Arm, waist and neck values are in radians; the hand values are the hand motors' own units
+(0 to 4095). Velocity and effort are stored as extra columns.
 
 ## Fingers
 
@@ -246,6 +300,7 @@ The guide is taken from the robot's configuration and vendor notes.
 | `web/gestures.svg` | Picture guide to the hand gestures |
 | `robot/data_collection.py` | Episode recording, upload, and delete-after-receipt |
 | `server/ingest_server.py` | Runs on your server: receives episodes and proves they are stored intact |
+| `server/to_lerobot.py` | Runs on your server: builds a LeRobot dataset from stored episodes |
 | `config/recording.json` | Which streams one episode records |
 | `robot/session.py` | The headset's small "hello / goodbye" message that opens and closes the page |
 | `deploy/nova-teleop.service` | Start the service together with the robot (optional) |
@@ -258,7 +313,7 @@ The guide is taken from the robot's configuration and vendor notes.
 | `tools/static_pose_test.py` | Sends a still pose with tiny, slow hand moves for a first careful test |
 | `tools/pcap_to_cap.py` | Turns a network capture into a test file |
 | `pc/` | Optional sender for a PC running XRoboToolkit (an alternative to the headset app) |
-| `tests/` | 150+ tests; none of them touch a real robot |
+| `tests/` | 170+ tests; none of them touch a real robot |
 | `docs/` | Details: [packet format](docs/WIRE_FORMAT.md), [discovery](docs/DISCOVERY.md), [frame analysis](docs/A3_FRAME_ANALYSIS.md) |
 
 ## The packets, briefly
@@ -296,11 +351,14 @@ recommended path.
 | ✅ | The control page reads the real robot's state; its buttons are tested against a stand-in robot |
 | ✅ | Checks, watchdog and sender lock are covered by tests |
 | ✅ | An operator has teleoperated the real robot through the bridge (arms and hands) |
-| ✅ | A real 20-second episode (three cameras at 30 pictures a second, joints at 100 a second) was recorded, uploaded, checked on the server and then deleted on the robot |
+| ✅ | A real 20-second episode (camera video at 30 pictures a second, joints at 100 a second) was recorded, uploaded, checked on the server and then deleted on the robot |
 | ❌ | The axis mapping between the headset app and the robot (`config/transform.json`) is still marked provisional |
 | ❌ | Depth pictures: not reachable on the robot's head computer |
-| ❌ | Conversion of episodes to a LeRobot dataset |
-| ❌ | Recording while teleoperating has not been tried yet, only with the robot standing still |
+| ✅ | That episode converts to a LeRobot v2.1 dataset: the table reads back, and each video has exactly one picture per row |
+| ❌ | The dataset has not been loaded with the LeRobot library itself yet |
+| ❌ | Recording while teleoperating has not been tried yet, only with the robot standing still. Whether the command streams fill is therefore unconfirmed |
+| ❌ | The hotkeys and sound cues have not been tried in a browser yet, and no pedal was connected |
+| ❌ | The right armpit camera cannot be recorded in usable quality |
 | ❌ | Wrist cameras: none fitted yet |
 
 ## First test on a real robot

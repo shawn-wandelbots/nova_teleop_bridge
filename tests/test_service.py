@@ -351,6 +351,24 @@ class TestService(unittest.TestCase):
         with open(os.path.join(ep_dir, "episode.json")) as fh:
             self.assertEqual(json.load(fh)["context_start"]["robot"]["state"], "Manual")
 
+    def test_delete_button_and_hotkey_settings(self):
+        self.recording_settings(True)
+        self.assertEqual(self.post("/api/record/discard")[0], 409 if not self.svc.data.status()["last_episode"]
+                         or self.svc.data.status()["last_episode"].get("discarded") else 200)
+        code, r = self.post("/api/record/start")
+        self.assertEqual(code, 200)
+        code, r2 = self.post("/api/record/discard")
+        self.assertEqual((code, r2["episode"]), (200, {"id": r["episode"], "where": "recording"}))
+        self.assertFalse(self.status()["data"]["recording"])
+        self.assertEqual(self.status()["settings"]["data_collection"]["hotkeys"],
+                         {"start": "F8", "stop": "F9", "discard": "F10"})
+        self.assertEqual(self.post("/api/settings", {"data_collection": {"hotkeys": {"start": "F9"}}})[0], 409)
+        self.assertEqual(self.post("/api/settings", {"data_collection": {"hotkeys": {"start": "<b>"}}})[0], 409)
+        code, r = self.post("/api/settings", {"data_collection": {"hotkeys": {"start": "Ctrl+Alt+KeyR", "discard": ""}}})
+        self.assertEqual((code, r["settings"]["data_collection"]["hotkeys"]),
+                         (200, {"start": "Ctrl+Alt+KeyR", "stop": "F9", "discard": ""}))
+        self.post("/api/settings", {"data_collection": {"hotkeys": {"start": "F8", "discard": "F10"}}})
+
     def test_goodbye_ends_the_episode(self):
         self.recording_settings(True)
         self.assertEqual(self.post("/api/record/start")[0], 200)

@@ -166,6 +166,7 @@ class DataCollection:
         self.upload = {"state": "idle", "episode": "", "error": "", "last_ok": "", "last_ok_t": 0,
                        "sent_bytes": 0, "total_bytes": 0}
         self.closing = False
+        self._up_lock = threading.Lock()          # held while an episode is uploaded or deleted
         self._wake = threading.Event()
         threading.Thread(target=self._upload_loop, daemon=True).start()
         threading.Thread(target=self._watch_loop, daemon=True).start()
@@ -223,20 +224,8 @@ class DataCollection:
         if rec is None:
             raise RuntimeError("no episode is being recorded")
         proc = rec["proc"]
-        if proc.poll() is None:
-            try:
-                os.killpg(proc.pid, signal.SIGINT)      # the recorder closes its file on Ctrl-C
-            except OSError:
-                pass
-            try:
-                proc.wait(timeout=self.stop_timeout)
-            except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except OSError:
-                    pass
-                proc.wait()
-                reason += "; recorder did not stop in time and was killed (file may be incomplete)"
+        if not self._halt(proc):
+            reason += "; recorder did not stop in time and was killed (file may be incomplete)"
         t1 = time.time()
         counts = {}
         try:
@@ -280,6 +269,64 @@ class DataCollection:
             % (rec["id"], info["duration_s"], manifest["total_bytes"] / 1e6, len(warnings)))
         self._wake.set()
         return summary
+
+    def _halt(self, proc):
+        """Ends the recorder.  False if it had to be killed."""
+        if proc.poll() is not None:
+            return True
+        try:
+            os.killpg(proc.pid, signal.SIGINT)          # the recorder closes its file on Ctrl-C
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=self.stop_timeout)
+            return True
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            proc.wait()
+            return False
+
+    def discard(self):
+        """Throws away the episode being recorded, or else the last finished one.
+
+        Only ever one episode per call, and never the same one twice.  An episode that has
+        already reached the server is not erased there: the server moves it to its
+        ``discarded`` folder, out of the way of the dataset."""
+        with self.lock:
+            rec, self.rec = self.rec, None
+        if rec is not None:
+            self._halt(rec["proc"])
+            shutil.rmtree(rec["dir"], ignore_errors=True)
+            log("episode %s: deleted while recording" % rec["id"])
+            return {"id": rec["id"], "where": "recording"}
+        with self.lock:
+            last = self.last_episode
+        if not last or last.get("discarded"):
+            raise RuntimeError("there is no episode to delete")
+        ep_id = last["id"]
+        with self._up_lock:                             # not while it is half-way to the server
+            ep_dir = os.path.join(self.spool(), ep_id)
+            local = os.path.isdir(ep_dir)
+            on_server = not local or os.path.exists(os.path.join(ep_dir, "receipt.json"))
+            if on_server:
+                s = self.get_settings()
+                if not s["server_url"]:
+                    raise RuntimeError("episode %s is no longer on the robot and no server is set" % ep_id)
+                try:
+                    self._request(s, "POST", "/api/episodes/%s/discard" % ep_id, body=b"{}",
+                                  headers={"Content-Type": "application/json"})
+                except (OSError, RuntimeError) as e:
+                    raise RuntimeError("could not delete episode %s on the server: %s" % (ep_id, e))
+            if local:
+                shutil.rmtree(ep_dir, ignore_errors=True)
+        with self.lock:
+            if self.last_episode and self.last_episode["id"] == ep_id:
+                self.last_episode = dict(self.last_episode, discarded=True)
+        log("episode %s: deleted (%s)" % (ep_id, "moved aside on the server" if on_server else "on the robot"))
+        return {"id": ep_id, "where": "server" if on_server else "robot"}
 
     def stop_if_recording(self, reason):
         try:
@@ -355,9 +402,12 @@ class DataCollection:
                     backoff = self.upload_interval
                     continue
                 ep_id, ep_dir, manifest = todo[0]
-                self._set_upload(state="uploading", episode=ep_id, error="", sent_bytes=0,
-                                 total_bytes=manifest["total_bytes"])
-                self.upload_episode(s, ep_id, ep_dir, manifest)
+                with self._up_lock:
+                    if not os.path.isdir(ep_dir):       # deleted by the operator meanwhile
+                        continue
+                    self._set_upload(state="uploading", episode=ep_id, error="", sent_bytes=0,
+                                     total_bytes=manifest["total_bytes"])
+                    self.upload_episode(s, ep_id, ep_dir, manifest)
                 self._set_upload(state="idle", last_ok=ep_id, last_ok_t=time.time(), episode="")
                 backoff = 0.1 if len(todo) > 1 else self.upload_interval
             except Exception as e:

@@ -28,7 +28,12 @@
     {"name": "/motion/control/waist_joint_state",        "group": "robot",        "required": true},
     {"name": "/motion/control/neck_joint_state",         "group": "robot",        "required": true},
     {"name": "/motion/control/leg_joint_state",          "group": "robot",        "required": false},
-    {"name": "/ta/whole_body_command",                   "group": "robot",        "required": false},
-    {"name": "/motion/control/hand_joint_command",       "group": "robot",        "required": false}
+    {"name": "/motion/control/arm_joint_command",        "group": "robot",        "required": false},
+    {"name": "/motion/control/hand_joint_command",       "group": "robot",        "required": false},
+    {"name": "/motion/control/waist_joint_command",      "group": "robot",        "required": false},
+    {"name": "/motion/control/neck_joint_command",       "group": "robot",        "required": false},
+    {"name": "/motion/control/leg_joint_command",        "group": "robot",        "required": false},
+    {"name": "/ta/whole_body_command/pb_3Aaimdk_2Eprotocol_2ETaWholeBodyCommandChannel", "group": "robot", "required": false},
+    {"name": "/remote/vr_data/pb_3Aaimdk_2Eprotocol_2EXRFrameData",                      "group": "robot", "required": false}
   ]
 }

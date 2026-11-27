@@ -259,6 +259,58 @@ class TestHandOver(Base):
         self.assertFalse(os.path.exists(self.server_dir("20260101_000000_dead")))
 
 
+class TestDelete(Base):
+    def test_delete_while_recording_leaves_nothing(self):
+        self.settings["server_url"] = self.url
+        d = self.make()
+        ep = d.start()
+        time.sleep(0.2)
+        self.assertEqual(d.discard(), {"id": ep, "where": "recording"})
+        self.assertFalse(d.recording())
+        time.sleep(0.4)
+        self.assertEqual(os.listdir(self.settings["spool_dir"]), [])
+        self.assertFalse(os.path.exists(self.server_dir(ep)))
+
+    def test_delete_last_episode_before_upload(self):
+        d = self.make()                                   # no server set: the episode waits on the robot
+        ep, _ = self.record(d)
+        self.assertEqual(d.discard(), {"id": ep, "where": "robot"})
+        self.assertEqual(os.listdir(self.settings["spool_dir"]), [])
+        self.assertTrue(d.status()["last_episode"]["discarded"])
+
+    def test_delete_last_episode_after_upload_moves_it_aside_on_the_server(self):
+        self.settings["server_url"] = self.url
+        d = self.make()
+        ep, _ = self.record(d)
+        self.assertTrue(wait_for(lambda: os.path.exists(os.path.join(self.server_dir(ep), "receipt.json"))))
+        self.assertTrue(wait_for(lambda: d.status()["upload"]["last_ok"] == ep))
+        self.assertEqual(d.discard(), {"id": ep, "where": "server"})
+        self.assertFalse(os.path.exists(self.server_dir(ep)))
+        self.assertTrue(os.path.exists(os.path.join(self.server_root, "discarded", ep, "bag", "bag_0.mcap")))
+
+    def test_only_one_episode_per_delete_and_never_an_older_one(self):
+        d = self.make()
+        with self.assertRaisesRegex(RuntimeError, "no episode"):
+            d.discard()
+        first, _ = self.record(d)
+        second, _ = self.record(d)
+        self.assertEqual(d.discard()["id"], second)
+        with self.assertRaisesRegex(RuntimeError, "no episode"):
+            d.discard()                                   # pressing twice must not eat the one before
+        self.assertEqual(os.listdir(self.settings["spool_dir"]), [first])
+
+    def test_server_unreachable_keeps_the_delete_pending(self):
+        self.settings["server_url"] = self.url
+        d = self.make()
+        ep, _ = self.record(d)
+        self.assertTrue(wait_for(lambda: d.status()["upload"]["last_ok"] == ep))
+        self.settings["server_url"] = "http://127.0.0.1:9"
+        with self.assertRaisesRegex(RuntimeError, "could not delete"):
+            d.discard()
+        self.settings["server_url"] = self.url
+        self.assertEqual(d.discard()["where"], "server")  # still possible afterwards
+
+
 class TestServer(Base):
     def req(self, method, path, body=None, headers=None, token=TOKEN):
         c = http.client.HTTPConnection("127.0.0.1", self.srv.server_address[1], timeout=5)

@@ -1,0 +1,4 @@
+numpy
+pyarrow
+mcap
+mcap-ros2-support

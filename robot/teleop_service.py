@@ -29,6 +29,7 @@ import argparse
 import hmac
 import json
 import os
+import re
 import secrets
 import select
 import signal
@@ -70,11 +71,16 @@ DEFAULT_SETTINGS = {
         "spool_dir": "/agibot/data/nova_teleop/spool",
         "max_spool_gb": 10,
         "min_free_gb": 3,
-        "cameras": {"chest": True, "waist": True, "armpit_right": True,
+        # armpit_right is off by default: its key frames are too large to reach the head
+        # computer intact, so its recorded video cannot be decoded (see README).
+        "cameras": {"chest": True, "waist": True, "armpit_right": False,
                     "wrist_left": False, "wrist_right": False},
+        # Keys that work while the control page has the keyboard focus (for a foot pedal).
+        "hotkeys": {"start": "F8", "stop": "F9", "discard": "F10"},
     },
 }
 UPLOAD_FORMATS = ("lerobot", "raw")
+HOTKEY_RE = re.compile(r"^((Ctrl|Alt|Shift|Meta)\+){0,4}[A-Za-z0-9]{1,20}$")   # e.g. F8, Ctrl+Alt+KeyR
 
 
 def log(msg):
@@ -120,6 +126,13 @@ def validate_settings(s):
             raise ValueError("headset address is not a valid IPv4 address")
     if not 1 <= d["min_free_gb"] <= 500:
         raise ValueError("free space to keep must be 1..500 GB")
+    keys = [d["hotkeys"][k] for k in ("start", "stop", "discard")]
+    for k in keys:
+        if k and not HOTKEY_RE.match(k):
+            raise ValueError("%r is not a usable key" % k)
+    used = [k for k in keys if k]
+    if len(set(used)) != len(used):
+        raise ValueError("each hotkey must be a different key")
     if len(d["task"]) > 200 or len(d["operator"]) > 100:
         raise ValueError("task or operator name is too long")
     return s
@@ -496,6 +509,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {"ok": True, "episode": self.svc.data.start()})
             elif path == "/api/record/stop":
                 return self._send(200, {"ok": True, "episode": self.svc.data.stop()})
+            elif path == "/api/record/discard":
+                return self._send(200, {"ok": True, "episode": self.svc.data.discard()})
             elif path == "/api/upload/retry":
                 self.svc.data.retry_now()
             elif path == "/api/settings":

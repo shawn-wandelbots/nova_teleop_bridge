@@ -6,8 +6,9 @@ two controllers.
 This repository is the part that runs **on the robot**. The headset app (Nova Teleop) lives
 in its own repository.
 
-> **Status, honestly.** The software passes its tests and the packet format matches recorded
-> traffic of the vendor's headset app byte for byte. It has **not yet moved the real robot**.
+> **Status, honestly.** An operator has teleoperated a real A3 with this software, and a recorded
+> episode has travelled from the robot to a server and been checked there. Depth pictures and
+> the conversion to a LeRobot dataset are **not** done.
 > See [What is proven and what is not](#what-is-proven-and-what-is-not).
 
 ---
@@ -167,22 +168,64 @@ What is on the page:
 
 - **Robot** – current state and whether the robot's three computers answer.
 - **Start teleoperation** – the three steps above, with live numbers for the headset stream.
+- **Record episodes** – start and stop a recording, and see what is waiting for upload.
 - **Settings** – which headset to accept, and settings for data collection.
 
-**Data collection is not built yet.** The settings are saved so the page is ready, but nothing
-is recorded or uploaded today. The plan:
+## Recording episodes for training
+
+One **episode** is one attempt at a task. *Start recording* and *Stop recording* on the control
+page mark its beginning and end. Closing the connection in the headset also ends it.
 
 ```mermaid
 flowchart LR
-    T["Teleop session"] --> R["Episode recorder<br/>on the robot"]
-    Cam["Cameras<br/>head now, wrists later"] --> R
-    R --> S[("Short-term storage<br/>on the robot")]
-    S -- "upload, then delete" --> Srv["Your server"]
-    Srv --> D["LeRobot dataset<br/>for training"]
+    Cam["Robot cameras<br/><i>compressed video, 30 pictures a second</i>"] --> R
+    J["Joints and commands<br/><i>100 times a second</i>"] --> R
+    R["Recorder on the robot<br/><i>standard ROS 2 recorder</i>"] --> S[("Episode folder<br/>on the robot")]
+    S -- "1. send each file<br/>with its checksum" --> Srv["Your server"]
+    Srv -- "2. receipt: every file read<br/>back from disk and checked" --> S
+    S -- "3. only now" --> Del["Robot deletes<br/>its copy"]
+    Srv --> D["LeRobot dataset<br/><i>conversion: not built yet</i>"]
 ```
 
-Two upload choices are foreseen: convert to the LeRobot format on the robot, or upload the
-raw recording and convert on the server.
+**What is in an episode**
+
+| File | What it is |
+|---|---|
+| `bag/*.mcap` | Every message exactly as the robot published it, with its type and the time it arrived. MCAP is the standard ROS 2 recording format. |
+| `episode.json` | Task, operator, start and end time, number of messages per stream, warnings, robot state, bridge settings |
+| `record.log` | What the recorder printed |
+| `manifest.json` | Size and SHA-256 checksum of each file |
+
+Raw data comes first: nothing is re-encoded, resampled or reformatted on the robot. The video
+stays in the camera program's own H.265 stream, and each video message keeps the camera's own
+timestamp.
+
+**What is recorded today** (see `config/recording.json`): the compressed video of the chest,
+waist and right armpit cameras, the joint states of arms, hands, waist, neck and legs, and the
+motion commands. Together this is about 2.7 MB per second, roughly 10 GB per hour.
+
+**What is not recorded: depth.** On the A3 the depth pictures cannot be received on the head
+computer where this service runs. Worse, merely listening for them makes the robot's own
+camera video drop to under one picture a second. The recorder therefore refuses raw camera
+topics in its configuration. Wrist cameras are prepared as a setting and need cameras fitted.
+
+**Looking after the robot's disk**
+
+- An episode is deleted on the robot only after the server's receipt lists every file with the
+  right size and checksum. Any doubt, and it stays and the upload is tried again.
+- Recording does not start when free space is below the limit in Settings, and stops by itself
+  when space runs low or the temporary storage limit is reached.
+- A half-written episode (power cut) is never uploaded and never deleted automatically.
+
+**The server side** is one file with no dependencies:
+
+```bash
+python3 server/ingest_server.py --root ~/nova_teleop_data --token <a secret of your choice>
+```
+
+Put the server's address (`http://<server>:8095`) and the same secret into Settings on the
+control page. Episodes land in `<root>/episodes/<episode>/` with a `receipt.json` next to them.
+The link is not encrypted: use it on a network you trust.
 
 ## Fingers
 
@@ -201,6 +244,9 @@ The guide is taken from the robot's configuration and vendor notes.
 | `robot/teleop_service.py` | Control page server |
 | `web/index.html` | The control page |
 | `web/gestures.svg` | Picture guide to the hand gestures |
+| `robot/data_collection.py` | Episode recording, upload, and delete-after-receipt |
+| `server/ingest_server.py` | Runs on your server: receives episodes and proves they are stored intact |
+| `config/recording.json` | Which streams one episode records |
 | `robot/session.py` | The headset's small "hello / goodbye" message that opens and closes the page |
 | `deploy/nova-teleop.service` | Start the service together with the robot (optional) |
 | `robot/teleop_bridge.py` | Bridge program: headset stream in, robot packets out |
@@ -212,7 +258,7 @@ The guide is taken from the robot's configuration and vendor notes.
 | `tools/static_pose_test.py` | Sends a still pose with tiny, slow hand moves for a first careful test |
 | `tools/pcap_to_cap.py` | Turns a network capture into a test file |
 | `pc/` | Optional sender for a PC running XRoboToolkit (an alternative to the headset app) |
-| `tests/` | 120+ tests; none of them touch a real robot |
+| `tests/` | 150+ tests; none of them touch a real robot |
 | `docs/` | Details: [packet format](docs/WIRE_FORMAT.md), [discovery](docs/DISCOVERY.md), [frame analysis](docs/A3_FRAME_ANALYSIS.md) |
 
 ## The packets, briefly
@@ -249,9 +295,13 @@ recommended path.
 | ✅ | The whole chain works on one machine: fake headset → bridge → stand-in robot listener |
 | ✅ | The control page reads the real robot's state; its buttons are tested against a stand-in robot |
 | ✅ | Checks, watchdog and sender lock are covered by tests |
-| ❌ | **The bridge has not driven the real robot yet** |
+| ✅ | An operator has teleoperated the real robot through the bridge (arms and hands) |
+| ✅ | A real 20-second episode (three cameras at 30 pictures a second, joints at 100 a second) was recorded, uploaded, checked on the server and then deleted on the robot |
 | ❌ | The axis mapping between the headset app and the robot (`config/transform.json`) is still marked provisional |
-| ❌ | Data collection: only the settings exist |
+| ❌ | Depth pictures: not reachable on the robot's head computer |
+| ❌ | Conversion of episodes to a LeRobot dataset |
+| ❌ | Recording while teleoperating has not been tried yet, only with the robot standing still |
+| ❌ | Wrist cameras: none fitted yet |
 
 ## First test on a real robot
 

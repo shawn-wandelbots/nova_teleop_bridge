@@ -16,7 +16,8 @@ What the page does:
   * switches the robot into and out of its teleoperation state (the same two calls the
     vendor phone app makes)
   * starts and stops the teleop bridge (robot/teleop_bridge.py), in test mode or live
-  * keeps the settings, including the ones for data collection that is not built yet
+  * records episodes (camera video and robot data) and hands them to a server
+    (robot/data_collection.py)
 
 Nothing here moves the robot by itself: every action is a button press on the page.
 Stdlib only.  The four-letter word keeps casual visitors out; it is not strong security,
@@ -43,6 +44,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 from robot import session as sess  # noqa: E402
+from robot import data_collection as dc  # noqa: E402
 
 WEB_DIR = os.path.join(ROOT, "web")
 BRIDGE = os.path.join(ROOT, "robot", "teleop_bridge.py")
@@ -61,11 +63,15 @@ DEFAULT_SETTINGS = {
         "task": "",
         "operator": "",
         "server_url": "",
-        "upload_format": "lerobot",          # lerobot | raw
+        "server_token": "",
+        # The robot always uploads the raw recording; conversion to LeRobot happens on the server.
+        "upload_format": "raw",              # raw | lerobot (lerobot is not built yet)
         "keep_local_copy": False,
-        "spool_dir": "~/nova_teleop_data/spool",
-        "max_spool_gb": 20,
-        "cameras": {"head": True, "wrist_left": False, "wrist_right": False},
+        "spool_dir": "/agibot/data/nova_teleop/spool",
+        "max_spool_gb": 10,
+        "min_free_gb": 3,
+        "cameras": {"chest": True, "waist": True, "armpit_right": True,
+                    "wrist_left": False, "wrist_right": False},
     },
 }
 UPLOAD_FORMATS = ("lerobot", "raw")
@@ -112,8 +118,10 @@ def validate_settings(s):
             socket.inet_aton(ip)
         except OSError:
             raise ValueError("headset address is not a valid IPv4 address")
-    # Recording is not built yet: the switch stays off however the page is used.
-    d["enabled"] = False
+    if not 1 <= d["min_free_gb"] <= 500:
+        raise ValueError("free space to keep must be 1..500 GB")
+    if len(d["task"]) > 200 or len(d["operator"]) > 100:
+        raise ValueError("task or operator name is too long")
     return s
 
 
@@ -138,6 +146,9 @@ class Service:
         self.last_interaction = 0.0
         self.bad_tries = 0
         self.locked_until = 0.0
+        self.data = dc.DataCollection(lambda: self.settings["data_collection"],
+                                      dc.load_recording_config(args.recording_config),
+                                      build_cmd=getattr(args, "recorder_cmd", None), context=self._episode_context)
         threading.Thread(target=self._poll_loop, daemon=True).start()
 
     # ---- page access ------------------------------------------------------------------------
@@ -166,6 +177,7 @@ class Service:
     def headset_left(self):
         """The operator closed the connection in the headset: stop feeding the robot and,
         if set so, take the robot out of teleoperation mode."""
+        self.data.stop_if_recording("the headset connection was closed")
         if self.bridge_running() and self.bridge_mode == "live":
             self.stop_bridge()
         with self.lock:
@@ -333,7 +345,25 @@ class Service:
 
     def shutdown(self):
         self.closing = True
+        self.data.shutdown()
         self._kill_bridge()
+
+    def _episode_context(self):
+        """Stored in every episode: what the robot and the headset link were doing."""
+        with self.lock:
+            robot = dict(self.cache.get("robot", {}))
+        ctx = {"robot": robot, "bridge_mode": self.bridge_mode if self.bridge_running() else None}
+        try:
+            with open(self.status_file) as fh:
+                ctx["link"] = json.load(fh)
+        except (OSError, ValueError):
+            pass
+        try:
+            with open(os.path.join(ROOT, "config", "transform.json")) as fh:
+                ctx["transform"] = json.load(fh)
+        except (OSError, ValueError):
+            pass
+        return ctx
 
     def _kill_bridge(self):
         with self.lock:
@@ -382,6 +412,7 @@ class Service:
         snap["transition"] = tr
         snap["bridge"] = self._bridge_status()
         snap["settings"] = settings
+        snap["data"] = self.data.status()
         snap["closes_in"] = max(0, int(self.a.idle_close_s - self.idle_seconds()))
         snap["time"] = time.time()
         return snap
@@ -461,6 +492,12 @@ class Handler(BaseHTTPRequestHandler):
                 self.svc.start_bridge(body.get("mode", "test"))
             elif path == "/api/bridge/stop":
                 self.svc.stop_bridge()
+            elif path == "/api/record/start":
+                return self._send(200, {"ok": True, "episode": self.svc.data.start()})
+            elif path == "/api/record/stop":
+                return self._send(200, {"ok": True, "episode": self.svc.data.stop()})
+            elif path == "/api/upload/retry":
+                self.svc.data.retry_now()
             elif path == "/api/settings":
                 return self._send(200, {"ok": True, "settings": self.svc.save_settings(body)})
             else:
@@ -483,6 +520,8 @@ def build_parser():
     ap.add_argument("--skillpilot-url", default="http://10.42.10.12:52893", help="service that switches teleop on/off")
     ap.add_argument("--robot-input-host", default="127.0.0.1")
     ap.add_argument("--robot-input-port", type=int, default=25618)
+    ap.add_argument("--recording-config", default=os.path.join(ROOT, "config", "recording.json"),
+                    help="what an episode records (default %(default)s)")
     ap.add_argument("--poll-s", type=float, default=2.0)
     ap.add_argument("--bridge-arg", action="append", default=[], help="extra argument for the bridge (repeatable)")
     ap.add_argument("--session-port", type=int, default=sess.DEFAULT_PORT,

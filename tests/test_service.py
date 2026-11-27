@@ -2,6 +2,7 @@
 import json
 import os
 import socket
+import sys
 import tempfile
 import threading
 import time
@@ -67,6 +68,14 @@ class TestService(unittest.TestCase):
             "--robot-input-port", str(free_udp_port(39400)), "--poll-s", "0.1", "--bridge-arg=--no-discovery",
             "--session-port", "0", "--no-standby", "--max-tries", "3", "--lockout-s", "0.4"])
         cls.args = args
+        # Stand-in for the ROS recorder: writes a file until it is interrupted.
+        fake = os.path.join(cls.tmp.name, "fake_recorder.py")
+        with open(fake, "w") as fh:
+            fh.write("import os, signal, sys, time\nos.makedirs(sys.argv[1])\nstop = []\n"
+                     "signal.signal(signal.SIGINT, lambda *a: stop.append(1))\n"
+                     "fh = open(os.path.join(sys.argv[1], 'bag_0.mcap'), 'wb')\n"
+                     "while not stop:\n    fh.write(b'x' * 1000); fh.flush(); time.sleep(0.01)\n")
+        args.recorder_cmd = lambda out, topics: [sys.executable, fake, out] + topics
         cls.svc = ts.Service(args)
         ts.Handler.svc = cls.svc
         cls.gate = ts.Gate(cls.svc, args)
@@ -306,15 +315,49 @@ class TestService(unittest.TestCase):
         self.assertEqual(code, 409)
         code, r = self.post("/api/settings", {"data_collection": {
             "server_url": "https://data.example", "upload_format": "raw", "enabled": True, "task": "t",
-            "cameras": {"head": False}, "unknown": 1}})
+            "cameras": {"chest": False}, "unknown": 1}})
         self.assertEqual(code, 200)
         d = r["settings"]["data_collection"]
         self.assertEqual((d["server_url"], d["upload_format"], d["task"]), ("https://data.example", "raw", "t"))
-        self.assertFalse(d["enabled"])                      # recording is not built: cannot be switched on
-        self.assertFalse(d["cameras"]["head"])
+        self.assertTrue(d["enabled"])
+        self.assertFalse(d["cameras"]["chest"])
+        self.assertTrue(d["cameras"]["waist"])
         self.assertNotIn("unknown", d)
         with open(self.svc.settings_path) as fh:
             self.assertEqual(json.load(fh)["data_collection"]["upload_format"], "raw")
+
+    # ---- recording ----
+    def recording_settings(self, enabled=True):
+        code, _ = self.post("/api/settings", {"data_collection": {
+            "enabled": enabled, "server_url": "", "spool_dir": os.path.join(self.tmp.name, "spool"), "min_free_gb": 1}})
+        self.assertEqual(code, 200)
+
+    def test_recording_buttons(self):
+        self.recording_settings(False)
+        self.assertEqual(self.post("/api/record/start")[0], 409)        # switched off in Settings
+        self.recording_settings(True)
+        code, r = self.post("/api/record/start")
+        self.assertEqual(code, 200)
+        self.assertTrue(self.status()["data"]["recording"])
+        self.assertEqual(self.post("/api/record/start")[0], 409)        # already recording
+        time.sleep(0.2)
+        code, r2 = self.post("/api/record/stop")
+        self.assertEqual((code, r2["episode"]["id"]), (200, r["episode"]))
+        d = self.status()["data"]
+        self.assertFalse(d["recording"])
+        self.assertEqual(d["pending"]["count"] >= 1, True)              # no server set: it stays on the robot
+        ep_dir = os.path.join(self.tmp.name, "spool", r["episode"])
+        self.assertTrue(os.path.exists(os.path.join(ep_dir, "manifest.json")))
+        with open(os.path.join(ep_dir, "episode.json")) as fh:
+            self.assertEqual(json.load(fh)["context_start"]["robot"]["state"], "Manual")
+
+    def test_goodbye_ends_the_episode(self):
+        self.recording_settings(True)
+        self.assertEqual(self.post("/api/record/start")[0], 200)
+        self.say(session.BYE)
+        self.assertTrue(wait_for(lambda: self.svc.data.status()["last_episode"] is not None
+                                 and not self.svc.data.recording()))
+        self.assertIn("headset", self.svc.data.status()["last_episode"]["stop_reason"])
 
 
 if __name__ == "__main__":

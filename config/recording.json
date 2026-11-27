@@ -1,0 +1,34 @@
+{
+  "_comment": [
+    "What one episode records, and how the standard ROS 2 recorder is started on the robot.",
+    "Only COMPRESSED camera streams are listed. Never add a camera's raw topics (rgb, depth,",
+    "compressed_depth): on the A3 the head computer cannot receive them, and merely listening",
+    "makes the robot's own camera video drop to under one frame a second."
+  ],
+  "ros": {
+    "setup": "/opt/ros/jazzy/setup.bash",
+    "domain_id": 232,
+    "extra_prefixes": [
+      "/opt/custom_ros/foxglove_msgs",
+      "/opt/agibot/share/ros2_package/aima_protocol_ros2_package",
+      "/opt/agibot/share/ros2_package/aimrt_protocol_ros2_package"
+    ],
+    "python_lib": "lib/python3.11/site-packages",
+    "storage": "mcap",
+    "nice": 5
+  },
+  "topics": [
+    {"name": "/hal/chest_front_d457_camera/stream",      "group": "chest",        "required": true},
+    {"name": "/hal/waist_front_d415_camera/stream",      "group": "waist",        "required": true},
+    {"name": "/hal/armpit_right_fisheye_camera/stream",  "group": "armpit_right", "required": true},
+    {"name": "/hal/wrist_left_d405_camera/stream",       "group": "wrist_left",   "required": true},
+    {"name": "/hal/wrist_right_d405_camera/stream",      "group": "wrist_right",  "required": true},
+    {"name": "/motion/control/arm_joint_state",          "group": "robot",        "required": true},
+    {"name": "/motion/control/hand_joint_state",         "group": "robot",        "required": true},
+    {"name": "/motion/control/waist_joint_state",        "group": "robot",        "required": true},
+    {"name": "/motion/control/neck_joint_state",         "group": "robot",        "required": true},
+    {"name": "/motion/control/leg_joint_state",          "group": "robot",        "required": false},
+    {"name": "/ta/whole_body_command",                   "group": "robot",        "required": false},
+    {"name": "/motion/control/hand_joint_command",       "group": "robot",        "required": false}
+  ]
+}
